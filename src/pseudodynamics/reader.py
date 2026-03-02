@@ -363,12 +363,24 @@ class TwoTimpepoint_AnnDS(HigDim_AnnDS):
         self.s = torch.from_numpy(self.cellstate).float()
         self.s = torch.cat([self.s]*len(self.popD['t'])).float()
 
+        # Per-timepoint cell indices (for CFM pairing)
+        self._build_timepoint_indices()
+
     
+    def _build_timepoint_indices(self):
+        """Build per-timepoint cell index arrays for CFM pairing."""
+        tp_key = self.timepoint_key
+        self.cells_per_tp = []
+        for t_val in self.popD['t']:
+            mask = self.adata.obs[tp_key].values == t_val
+            indices = np.where(mask)[0]
+            self.cells_per_tp.append(indices)
+
     def __len__(self):
         return int(self.cellstate.shape[0] // self.batchsize)
 
     def __getitem__(self, i):
-        
+
 
         # sample current t
         i_t = np.random.randint(0, self.n_timepoint-1)  # the i^th timepoint index
@@ -387,12 +399,24 @@ class TwoTimpepoint_AnnDS(HigDim_AnnDS):
         # get time
         t = torch.full(size=(self.batchsize,), fill_value=self.T_b[i_t]).float()
         t_p1 = torch.full(size=(self.batchsize,), fill_value=self.T_b[i_tp1]).float()
-        
-        # the density of two consecutive 
+
+        # the density of two consecutive
         u_t = self.u_b[i_t, s_index]
         u_tp1 = self.u_b[i_tp1, s_index]  # density of the t plus 1
 
-        return {'s':s, 't':t, 'tp1':t_p1, 'ut':u_t, 'utp1':u_tp1, 'deltax':deltax}
+        batch = {'s':s, 't':t, 'tp1':t_p1, 'ut':u_t, 'utp1':u_tp1, 'deltax':deltax}
+
+        # CFM pairing: sample cells from consecutive timepoints
+        if hasattr(self, 'cells_per_tp'):
+            idx_t  = self.cells_per_tp[i_t]
+            idx_tp1 = self.cells_per_tp[i_tp1]
+            n_cfm = min(self.batchsize, len(idx_t), len(idx_tp1))
+            x0_idx = np.random.choice(idx_t,  size=n_cfm, replace=len(idx_t)  < n_cfm)
+            x1_idx = np.random.choice(idx_tp1, size=n_cfm, replace=len(idx_tp1) < n_cfm)
+            batch['cfm_x0'] = torch.from_numpy(self.cellstate[x0_idx]).float()
+            batch['cfm_x1'] = torch.from_numpy(self.cellstate[x1_idx]).float()
+
+        return batch
 
 class TwoTimpepoint_AnnDS_fastmode(TwoTimpepoint_AnnDS):
     def __init__(self, *args, pseudobulk_key='pseudo_bulk', resolution=None, n_pseudobulk=None, **kwargs):

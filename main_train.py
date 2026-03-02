@@ -58,6 +58,8 @@ optional_args.add_argument("--growth_weight", type=float, required=False, defaul
 optional_args.add_argument("--time_scale_factor", type=float, required=False, default=5, help='the scale the time for ode')
 optional_args.add_argument("--norm_time", type=str, required=False, default=False, help='Ways to normlize the timepoint, [False, min_minus, log, none]')
 optional_args.add_argument("--time_sensitive", action="store_true", required=False, help='Whether to include time in behavoir functions')
+optional_args.add_argument("--cfm_weight", type=float, required=False, default=None, help='Weight for Conditional Flow Matching velocity loss (0 = disabled)')
+optional_args.add_argument("--D_var_weight", type=float, required=False, default=None, help='Weight for diffusion variance-matching + entropy losses (0 = disabled)')
 optional_args.add_argument("--progress_bar", type=str, required=False, default="True", help='whether show progress bar on screen, boolen value, default True')
 
 args = parser.parse_args()
@@ -129,13 +131,15 @@ model = model_class(
         channels = channels,
         activation_fn='Tanh',
         ode_tol = args.tol,
-        D_penalty = args.D_penalty, 
+        D_penalty = args.D_penalty,
         deltax_weight = args.deltax_weight,
         weight_intensity = args.weight_intensity,
         growth_weight = args.growth_weight,
         R_weight = args.R_weight,
         time_scale_factor = args.time_scale_factor,
         time_sensitive = args.time_sensitive,
+        cfm_weight = getattr(args, 'cfm_weight', None),
+        D_var_weight = getattr(args, 'D_var_weight', None),
         **model_kws
     )
 

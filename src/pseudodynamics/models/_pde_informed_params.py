@@ -202,9 +202,84 @@ class pde_params_base(pl.LightningModule):
         D_L2 = torch.norm(D, p=2).sum()  # in case D is high dimensional
         return D_L2 
 
+    def diffusion_variance_loss(self, s, t, tp1, k=15):
+        r"""
+        Variance-matching loss for D(s,t): the learned diffusion coefficient
+        should correlate with local expression variance across timepoints.
+
+        Cells in regions with high density change (high |u(s,t+1) - u(s,t)|)
+        should have higher D, as this indicates stochastic branching.
+
+        Arguments
+        ---------
+        s : tensor (n, n_dim), cell states
+        t : tensor (n,), time at t_k (already normalised)
+        tp1 : tensor (n,), time at t_{k+1}
+        k : int, neighbourhood size for local variance estimation
+        """
+        with torch.no_grad():
+            # Estimate local variance from KNN in cell-state space
+            # Use pairwise distances to find local spread
+            dists = torch.cdist(s, s)                     # (n, n)
+            _, knn_idx = dists.topk(k, dim=1, largest=False)  # (n, k)
+
+            # Local variance: variance of cell states in k-neighbourhood
+            neighbours = s[knn_idx]                       # (n, k, n_dim)
+            local_var = neighbours.var(dim=1).mean(dim=1)  # (n,)
+
+            # Normalise to [0, 1] for stable loss
+            local_var = local_var / (local_var.max() + 1e-8)
+
+        # D should be proportional to local variance
+        D_pred = self.D(s, t.unsqueeze(1) if t.dim() == 1 else t)
+        D_magnitude = torch.abs(D_pred).mean(dim=1) if D_pred.dim() > 1 else torch.abs(D_pred).squeeze()
+        D_norm = D_magnitude / (D_magnitude.max().detach() + 1e-8)
+
+        # Negative correlation loss: encourage D to correlate with local_var
+        loss = -torch.mean(
+            (D_norm - D_norm.mean()) * (local_var - local_var.mean())
+        ) / (D_norm.std().detach() * local_var.std() + 1e-8)
+
+        return loss
+
+    def diffusion_entropy_loss(self, s, t, u_t, u_tp1):
+        r"""
+        Entropy regularization: D should be higher at branching points,
+        identified by high entropy in density change between timepoints.
+
+        Cells where the density ratio u(t+1)/u(t) varies most across
+        neighbours are at fate decision points and need higher D.
+
+        Arguments
+        ---------
+        s : tensor (n, n_dim), cell states
+        t : tensor (n,), time
+        u_t : tensor (n,), density at t
+        u_tp1 : tensor (n,), density at t+1
+        """
+        with torch.no_grad():
+            # Density ratio captures where mass is redistributing
+            ratio = (u_tp1 + 1e-8) / (u_t + 1e-8)
+            # Normalise into a probability-like quantity per cell
+            p = ratio / (ratio.sum() + 1e-8)
+            # Per-cell surprise (high = unexpected density change = branching)
+            entropy_signal = -torch.log(p + 1e-8)
+            entropy_signal = entropy_signal / (entropy_signal.max() + 1e-8)
+
+        D_pred = self.D(s, t.unsqueeze(1) if t.dim() == 1 else t)
+        D_magnitude = torch.abs(D_pred).mean(dim=1) if D_pred.dim() > 1 else torch.abs(D_pred).squeeze()
+        D_norm = D_magnitude / (D_magnitude.max().detach() + 1e-8)
+
+        # Encourage D to be high where entropy signal is high
+        loss = -torch.mean(
+            (D_norm - D_norm.mean()) * (entropy_signal - entropy_signal.mean())
+        ) / (D_norm.std().detach() * entropy_signal.std() + 1e-8)
+
+        return loss
+
     def area_loss(self, u, u_hat, var=None):
         r"""
-        use the area under curve to compute loss 
+        use the area under curve to compute loss
 
         Arguments
         ---------
@@ -498,11 +573,11 @@ class pde_params(pde_params_base):
                     checkpoint_path = tompos_config.find_lastest_ckpt(), 
                     map_location='cpu')
     """
-    def __init__(self, channels, growth_weight=None, collapse_D = True, collapse_v = False, g_channels=None, v_channels=None, D_channels=None, time_sensitive=True, lr=3e-4, ode_tol=1e-4, activation_fn:Union[str, list] = 'Tanh', R_weight = None, deltax_weight = None, D_penalty = None, weight_intensity=None, time_scale_factor=None, pop_weight=None):
-        
+    def __init__(self, channels, growth_weight=None, collapse_D = True, collapse_v = False, g_channels=None, v_channels=None, D_channels=None, time_sensitive=True, lr=3e-4, ode_tol=1e-4, activation_fn:Union[str, list] = 'Tanh', R_weight = None, deltax_weight = None, D_penalty = None, weight_intensity=None, time_scale_factor=None, pop_weight=None, cfm_weight=None, D_var_weight=None):
+
         super().__init__(channels=channels, collapse_D = collapse_D, collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, time_sensitive=True, lr=lr, ode_tol=ode_tol, activation_fn=activation_fn, D_penalty = D_penalty, weight_intensity=weight_intensity, deltax_weight=deltax_weight)
         self.save_hyperparameters()
-        
+
         self.time_sensitive = time_sensitive
         self.lr = lr
         self.R_weight = 1 if R_weight is None else R_weight
@@ -513,6 +588,8 @@ class pde_params(pde_params_base):
         self.growth_weight = 0 if growth_weight is None else growth_weight
         self.log_transform = False
         self.pop_weight = pop_weight
+        self.cfm_weight = 0 if cfm_weight is None else cfm_weight
+        self.D_var_weight = 0 if D_var_weight is None else D_var_weight
        
         MLP_Module = MLP_surrogate
         # u_theta, density function
@@ -609,6 +686,49 @@ class pde_params(pde_params_base):
         
         return u_int, s_t, duds, growth, drift, diffuse
 
+    def cfm_velocity_loss(self, x0, x1, t_k, t_kp1) -> torch.Tensor:
+        r"""
+        Conditional Flow Matching velocity loss.
+
+        Given cell states x0 from timepoint t_k and x1 from t_{k+1},
+        interpolates along straight paths and regresses the velocity network
+        v_θ against the conditional velocity field u_t = (x1 - x0).
+
+        Uses OT coupling via torchcfm when available, falling back to
+        random pairing otherwise.
+
+        Arguments
+        ---------
+        x0 : tensor (n, n_dim), cell states sampled from timepoint t_k
+        x1 : tensor (n, n_dim), cell states sampled from timepoint t_{k+1}
+        t_k : tensor (n,), normalised time at t_k
+        t_kp1 : tensor (n,), normalised time at t_{k+1}
+        """
+        try:
+            from torchcfm.conditional_flow_matching import (
+                ExactOptimalTransportConditionalFlowMatcher,
+            )
+            cfm = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
+            # Returns: interpolation time τ, x_τ, target velocity u_τ
+            tau, x_t, u_t = cfm.sample_location_and_conditional_flow(x0, x1)
+        except Exception:
+            # Fallback: random pairing, uniform τ
+            tau = torch.rand(x0.shape[0], 1, device=x0.device)
+            x_t = (1 - tau) * x0 + tau * x1
+            u_t = x1 - x0
+            tau = tau.squeeze(1)
+
+        # Map interpolation time τ ∈ [0,1] to actual normalised time
+        t_actual = t_k[:x_t.shape[0]] + tau * (t_kp1[:x_t.shape[0]] - t_k[:x_t.shape[0]])
+        t_in = t_actual.unsqueeze(1)  # (n, 1)
+
+        # Predict velocity at interpolated point
+        v_pred = self.v(x_t, t_in)
+
+        # MSE loss against conditional velocity
+        loss = torch.mean((v_pred - u_t) ** 2)
+        return loss
+
     def residual_loss(self, s, t) -> torch.Tensor:
         """
         calculate the loss for collocation points, this loss inject the pde into the neural network
@@ -667,17 +787,38 @@ class pde_params(pde_params_base):
             growth_loss = self.loss_fn(mass_gain, predicted_gain, weight=2) / mass_gain
         
 
+        # loss 4 (optional): Conditional Flow Matching velocity loss
+        cfm_loss = torch.tensor(0.0, device=s.device)
+        if self.cfm_weight > 0 and 'cfm_x0' in train_batch:
+            cfm_loss = self.cfm_velocity_loss(
+                train_batch['cfm_x0'], train_batch['cfm_x1'], t, tp1,
+            )
+
+        # loss 5 (optional): Diffusion field variance-matching + entropy losses
+        D_var_loss = torch.tensor(0.0, device=s.device)
+        if self.D_var_weight > 0:
+            D_var_loss = (
+                self.diffusion_variance_loss(s, t, tp1) +
+                self.diffusion_entropy_loss(s, t, ut, utp1)
+            )
+
         total_loss = log_density_loss_t + log_density_loss_tp1 + \
                     2 * log_sim_loss_tp1 + \
                     self.D_penalty * D_norm + \
                     self.deltax_weight * v_loss + \
-                    self.growth_weight * growth_loss
+                    self.growth_weight * growth_loss + \
+                    self.cfm_weight * cfm_loss + \
+                    self.D_var_weight * D_var_loss
 
 
         with torch.no_grad():
             # self.log("residual_loss", Loss_r, on_epoch=True)
             # self.log("boundary_loss", Loss_b, on_epoch=True)
             self.log("population_loss", growth_loss.item(), on_epoch=True)
+            if self.cfm_weight > 0:
+                self.log("cfm_loss", cfm_loss.item(), on_epoch=True)
+            if self.D_var_weight > 0:
+                self.log("D_var_loss", D_var_loss.item(), on_epoch=True)
             self.log("boundary_loss",  log_density_loss_t.item(),  on_epoch=True)
             self.log("residual loss", R_loss.item(), on_epoch=True)
             self.log("integrat_loss", log_sim_loss_tp1.item(), on_epoch=True)
