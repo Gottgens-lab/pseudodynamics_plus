@@ -146,7 +146,7 @@ pynndescent @ file:///home/conda/feedstock_root/build_artifacts/pynndescent_1734
 pyparsing @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pyparsing_1753873557/work
 python-dateutil @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_python-dateutil_1751104122/work
 pytorch-fid==0.3.0
-pytorch-lightning==2.5.5
+pytorch-lightning==2.4.0
 pytz @ file:///home/conda/feedstock_root/build_artifacts/pytz_1742920838005/work
 PyYAML==6.0.3
 pyzmq==27.1.0
@@ -200,14 +200,14 @@ threadpoolctl @ file:///home/conda/feedstock_root/build_artifacts/threadpoolctl_
 tinycss2==1.4.0
 tomlkit==0.13.3
 toolz==1.0.0
-torch==2.9.0
+# torch==2.4.1
 torchcde==0.2.5
 torchcfm==1.0.7
 torchdiffeq==0.2.5
 torchdyn==1.0.6
-torchmetrics==1.8.2
+# torchmetrics==1.4.1
 torchsde==0.2.6
-torchvision==0.24.0
+# torchvision==0.19.1
 tornado==6.5.2
 tqdm @ file:///home/conda/feedstock_root/build_artifacts/tqdm_1735661334605/work
 traitlets==5.14.3
