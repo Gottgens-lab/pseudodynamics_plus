@@ -678,9 +678,10 @@ def make_coord_adata(adata, cellstate_key, n_dimension, v = None):
     new_ad.obsp['connectivities'] = adata.obsp['connectivities'].copy()
     new_ad.obsp['distances'] = adata.obsp['distances'].copy()
     new_ad.layers['cellstate'] = new_ad.X.copy()
-    new_ad.obsm["X_pca"] = adata.obsm["X_pca"]
-    new_ad.obsm["X_pca_harmony"] = adata.obsm["X_pca_harmony"]
-    new_ad.obsm["X_umap"] = adata.obsm["X_umap"]
+    for key in adata.obsm_keys():
+        # if key.startswith('X_'):
+        #     new_ad.obsm[key] = adata.obsm[key].copy()
+        new_ad.obsm[key] = adata.obsm[key]
     
     # pop info
     new_ad.uns = adata.uns.copy()

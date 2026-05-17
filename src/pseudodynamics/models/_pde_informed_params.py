@@ -573,9 +573,31 @@ class pde_params(pde_params_base):
                     checkpoint_path = tompos_config.find_lastest_ckpt(), 
                     map_location='cpu')
     """
-    def __init__(self, channels, growth_weight=None, collapse_D = True, collapse_v = False, g_channels=None, v_channels=None, D_channels=None, time_sensitive=True, lr=3e-4, ode_tol=1e-4, activation_fn:Union[str, list] = 'Tanh', R_weight = None, deltax_weight = None, D_penalty = None, weight_intensity=None, time_scale_factor=None, pop_weight=None, cfm_weight=None, D_var_weight=None):
+    def __init__(self, channels,
+                    growth_weight=None,
+                    collapse_D = True,
+                    collapse_v = False,
+                    g_channels=None,
+                    v_channels=None,
+                    D_channels=None,
+                    time_sensitive=True,
+                    lr=3e-4,
+                    ode_tol=1e-4,
+                    activation_fn:Union[str,list] = 'Tanh',
+                    R_weight = None,
+                    deltax_weight = None,
+                    D_penalty = None,
+                    weight_intensity=None,
+                    time_scale_factor=None,
+                    pop_weight=None,
+                    cfm_weight=None,
+                    D_var_weight=None,
+                    neuralode_weight=None
+                ):
 
-        super().__init__(channels=channels, collapse_D = collapse_D, collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, time_sensitive=True, lr=lr, ode_tol=ode_tol, activation_fn=activation_fn, D_penalty = D_penalty, weight_intensity=weight_intensity, deltax_weight=deltax_weight)
+        super().__init__(channels=channels,collapse_D = collapse_D,collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, 
+                         time_sensitive=True,  lr=lr, ode_tol=ode_tol, activation_fn=activation_fn, 
+                         D_penalty = D_penalty, weight_intensity=weight_intensity, deltax_weight=deltax_weight)
         self.save_hyperparameters()
 
         self.time_sensitive = time_sensitive
@@ -590,6 +612,7 @@ class pde_params(pde_params_base):
         self.pop_weight = pop_weight
         self.cfm_weight = 0 if cfm_weight is None else cfm_weight
         self.D_var_weight = 0 if D_var_weight is None else D_var_weight
+        self.neuralode_weight = 2 if neuralode_weight is None else neuralode_weight
        
         MLP_Module = MLP_surrogate
         # u_theta, density function
@@ -626,7 +649,7 @@ class pde_params(pde_params_base):
         device = s.device
         t_in = torch.full((s.shape[0],1), t.item()*self.time_scale_factor).float().to(device)
 
-        with torch.set_grad_enabled(True):
+        with torch.set_grad_enabled(True):  
 
             s.requires_grad_(True)
             t_in.requires_grad_(True)
@@ -790,9 +813,10 @@ class pde_params(pde_params_base):
         # loss 4 (optional): Conditional Flow Matching velocity loss
         cfm_loss = torch.tensor(0.0, device=s.device)
         if self.cfm_weight > 0 and 'cfm_x0' in train_batch:
-            cfm_loss = self.cfm_velocity_loss(
-                train_batch['cfm_x0'], train_batch['cfm_x1'], t, tp1,
-            )
+            for i in range(10):
+                cfm_loss += self.cfm_velocity_loss(
+                    train_batch['cfm_x0'], train_batch['cfm_x1'], t, tp1,
+                )
 
         # loss 5 (optional): Diffusion field variance-matching + entropy losses
         D_var_loss = torch.tensor(0.0, device=s.device)
@@ -803,12 +827,13 @@ class pde_params(pde_params_base):
             )
 
         total_loss = log_density_loss_t + log_density_loss_tp1 + \
-                    2 * log_sim_loss_tp1 + \
+                    self.neuralode_weight * log_sim_loss_tp1 + \
                     self.D_penalty * D_norm + \
                     self.deltax_weight * v_loss + \
                     self.growth_weight * growth_loss + \
                     self.cfm_weight * cfm_loss + \
-                    self.D_var_weight * D_var_loss
+                    self.D_var_weight * D_var_loss + \
+                    self.R_weight * R_loss
 
 
         with torch.no_grad():
