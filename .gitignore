@@ -46,17 +46,4 @@ docs/api/genapi/pseudodynamics.plotting_fns.param_plot.params_in_umap.rst
 docs/api/genapi/pseudodynamics.plotting_fns.param_plot.plot_gene_trends.rst
 docs/api/genapi/pseudodynamics.reader.HigDim_AnnDS.rst
 docs/api/genapi/pseudodynamics.reader.TwoTimpepoint_AnnDS.rst
-
-# build / training outputs
-logs/
-figures/
-results/
-*.log
-
-# editor & tool state
-.claude/
-.ipynb_checkpoints/
-
-# nested git repos cloned locally for convenience
-pseudodynamics-manuscript/
-scdiffeq-analyses/
+>>>>>>> d955866dd2a5c9005e95b6562ef359982e59b9b4
