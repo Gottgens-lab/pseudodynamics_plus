@@ -212,8 +212,14 @@ trainer = pl.Trainer(
                     default_root_dir=save_path,
                     devices = gpu_device,
                     max_epochs=getattr(args, 'max_epochs', 400),
+                    # save_last=True guarantees a checkpoint even when val_dataloader
+                    # is empty (cord-blood PCA: val cells × 30 dims don't fill a
+                    # batch_size=1024 batch, so val_loss is never logged and
+                    # monitor="val_loss" would save nothing).  Klein is unaffected —
+                    # save_last adds a "last.ckpt" alongside the two best-val checkpoints.
                     callbacks=[callbacks.ModelCheckpoint(filename='{epoch}-{val_loss:.8f}',
-                                                monitor="val_loss", mode="min", save_top_k=2)]
+                                                monitor="val_loss", mode="min", save_top_k=2,
+                                                save_last=True)]
                     )
 
 
