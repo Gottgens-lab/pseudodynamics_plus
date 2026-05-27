@@ -748,8 +748,9 @@ class pde_params(pde_params_base):
         # Predict velocity at interpolated point
         v_pred = self.v(x_t, t_in)
 
-        # MSE loss against conditional velocity
-        loss = torch.mean((v_pred - u_t) ** 2)
+        # v is dx/dt in real-time; u_t = x1-x0 is per-τ-unit displacement, divide by Δt to convert to per-real-time-unit drift
+        dt = (t_kp1[:x_t.shape[0]] - t_k[:x_t.shape[0]]).unsqueeze(1).clamp(min=1e-6)
+        loss = torch.mean((v_pred - u_t / dt) ** 2)
         return loss
 
     def residual_loss(self, s, t) -> torch.Tensor:
@@ -766,7 +767,7 @@ class pde_params(pde_params_base):
             t.requires_grad_(True)
 
             dudt, growth, drift, diffuse = self.equation(s, t)
-            rhs = growth + drift + diffuse
+            rhs = growth - drift + diffuse
 
         return self.loss_fn(rhs.squeeze(), dudt.squeeze())
         # return self.loss_fn(torch.log(rhs.squeeze()+1e-10), torch.log(dudt.squeeze()+1e-10))
