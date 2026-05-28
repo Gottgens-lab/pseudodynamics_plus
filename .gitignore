@@ -8,6 +8,9 @@
 **.DS_Store
 data
 **.vscode
+**.ipynb_checkpoints
+.claude
+logs
 docs/_build
 docs/generated
 docs/api/generated/pseudodynamics._config.rst

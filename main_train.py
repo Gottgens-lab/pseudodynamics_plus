@@ -61,6 +61,9 @@ optional_args.add_argument("--time_sensitive", action="store_true", required=Fal
 optional_args.add_argument("--cfm_weight", type=float, required=False, default=None, help='Weight for Conditional Flow Matching velocity loss (0 = disabled)')
 optional_args.add_argument("--D_var_weight", type=float, required=False, default=None, help='Weight for diffusion variance-matching + entropy losses (0 = disabled)')
 optional_args.add_argument("--neuralode_weight", type=float, required=False, default=None, help='Weight for the Neural-ODE simulation loss (default 2 to preserve previous behaviour)')
+optional_args.add_argument("--per_cell_growth_loss", action="store_true", required=False, help='Use per-cell DeepRUOT-style mass-flow supervision for the growth loss (default: original .sum()-based version)')
+optional_args.add_argument("--density_estimator", type=str, required=False, default="kde", choices=["kde", "gmm"], help='Density estimator for u_obs: "kde" (default, scipy.stats.gaussian_kde) or "gmm" (sklearn GaussianMixture with BIC-selected k)')
+optional_args.add_argument("--gmm_k_max", type=int, required=False, default=5, help='Max number of GMM components to test by BIC when --density_estimator=gmm (default 5)')
 optional_args.add_argument("--seed", type=int, required=False, default=None, help='Random seed for pl.seed_everything; if None no seed is set')
 optional_args.add_argument("--max_epochs", type=int, required=False, default=400, help='maximum training epochs (default 400)')
 optional_args.add_argument("--progress_bar", type=str, required=False, default="True", help='whether show progress bar on screen, boolen value, default True')
@@ -158,6 +161,7 @@ model = model_class(
         cfm_weight = getattr(args, 'cfm_weight', None),
         D_var_weight = getattr(args, 'D_var_weight', None),
         neuralode_weight = getattr(args, 'neuralode_weight', None),
+        per_cell_growth_loss = getattr(args, 'per_cell_growth_loss', False),
         **model_kws
     )
 
@@ -180,7 +184,7 @@ if args.pretrained is not None:
 ##      define dataset      ##
 ##############################
 
-ds_kws = dict(  timepoint_idx = args.timepoint_idx, 
+ds_kws = dict(  timepoint_idx = args.timepoint_idx,
                 n_dimension = args.n_dimension,
                 cellstate_key=args.cellstate_key,  #'DM_EigenVector'
                 knn_volume = eval(args.knn_volume) if isinstance(args.knn_volume, str) else args.knn_volume,
@@ -190,6 +194,37 @@ ds_kws = dict(  timepoint_idx = args.timepoint_idx,
                 kde_kws = {"bw_method":args.bw},
                 batchsize=args.batch_size
             )
+
+# Optional GMM density (opt-in via --density_estimator=gmm; default kde is unchanged)
+if getattr(args, 'density_estimator', 'kde') == 'gmm':
+    from sklearn.mixture import GaussianMixture
+    import numpy as _np
+    print(f"\n[main_train] Building GMM density estimators (BIC over k=1..{args.gmm_k_max})")
+    _coords = adata.obsm[args.cellstate_key][:, :args.n_dimension]
+    _tp_arr = adata.obs[ds_kws.get('timepoint_key', 'timepoint_tx_days')].values \
+              if 'timepoint_key' in ds_kws else adata.obs['timepoint_tx_days'].values
+    _density_funs = []
+    for _t in sorted(set(_tp_arr)):
+        _ct = _coords[_tp_arr == _t]
+        _best_bic = _np.inf; _best_gmm = None
+        for _k in range(1, args.gmm_k_max + 1):
+            _gmm = GaussianMixture(n_components=_k, covariance_type='full',
+                                    random_state=42, max_iter=500)
+            try:
+                _gmm.fit(_ct)
+                _bic = _gmm.bic(_ct)
+                if _bic < _best_bic:
+                    _best_bic = _bic; _best_gmm = _gmm
+            except Exception:
+                continue
+        def _make_fn(_g):
+            def _fn(query, **_):
+                q = query.T if query.shape[0] == _coords.shape[1] else query
+                return _np.exp(_g.score_samples(q))
+            return _fn
+        _density_funs.append(_make_fn(_best_gmm))
+        print(f"  t={_t}: n_cells={(_tp_arr == _t).sum()}, BIC-selected k={_best_gmm.n_components}, BIC={_best_bic:.1f}")
+    ds_kws['density_funs'] = _density_funs
 
 train_DS = reader.TwoTimpepoint_AnnDS(AnnData=adata, split='train', **ds_kws)
 val_DS = reader.TwoTimpepoint_AnnDS(AnnData=adata, split='val', **ds_kws)

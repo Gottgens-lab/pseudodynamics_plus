@@ -602,7 +602,8 @@ class pde_params(pde_params_base):
                     pop_weight=None,
                     cfm_weight=None,
                     D_var_weight=None,
-                    neuralode_weight=None
+                    neuralode_weight=None,
+                    per_cell_growth_loss=False
                 ):
 
         super().__init__(channels=channels,collapse_D = collapse_D,collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, 
@@ -623,6 +624,9 @@ class pde_params(pde_params_base):
         self.cfm_weight = 0 if cfm_weight is None else cfm_weight
         self.D_var_weight = 0 if D_var_weight is None else D_var_weight
         self.neuralode_weight = 2 if neuralode_weight is None else neuralode_weight
+        # Opt-in: per-cell mass match (DeepRUOT-style) instead of summed total.
+        # Default False preserves original behaviour.
+        self.per_cell_growth_loss = bool(per_cell_growth_loss)
        
         MLP_Module = MLP_surrogate
         # u_theta, density function
@@ -839,7 +843,16 @@ class pde_params(pde_params_base):
 
         # duds_loss = -1 * nn.functional.cosine_similarity(duds[-1], duds_tp1)
         # constrain g by population size
-        if self.log_transform:
+        if self.per_cell_growth_loss:
+            # Per-cell DeepRUOT-style mass-flow supervision.
+            # Match per-cell observed mass change (utp1 - ut) to per-cell
+            # predicted integrated growth (growth[-1]). Preserves spatial
+            # supervision instead of collapsing via .sum(). Each cell becomes
+            # an independent constraint, giving g_net dense gradient signal.
+            mass_gain_per_cell = utp1 - ut
+            predicted_gain_per_cell = growth[-1]
+            growth_loss = self.loss_fn(predicted_gain_per_cell, mass_gain_per_cell, weight=2)
+        elif self.log_transform:
             left = torch.exp(utp1).sum()
             right = torch.exp(ut + growth[-1]).sum()
             growth_loss = self.loss_fn(torch.log(left), torch.log(right))
