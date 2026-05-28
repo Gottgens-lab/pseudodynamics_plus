@@ -104,6 +104,9 @@ class ExperimentConfig:
                 'weight_intensity': getattr(model, 'weight_intensity', None),
                 'time_scale_factor': getattr(model, 'time_scale_factor', None),
                 'time_sensitive': getattr(model, 'time_sensitive', None),
+                'cfm_weight': getattr(model, 'cfm_weight', None),
+                'D_var_weight': getattr(model, 'D_var_weight', None),
+                'neuralode_weight': getattr(model, 'neuralode_weight', None),
                 'v_channels': getattr(model, 'v_channels', None),
                 'g_channels': getattr(model, 'g_channels', None),
                 'D_channels': getattr(model, 'D_channels', None),
@@ -175,16 +178,31 @@ class ExperimentConfig:
 
     def find_lastest_ckpt(self):
         """
-        find the ckpt file with the minimum loss given the config class
+        Find the ckpt file with the minimum val_loss.
+
+        Fallback: when val_loss was never logged (e.g. cord-blood PCA whose
+        val_dataloader is empty), the ModelCheckpoint monitor fires no match and
+        only ``last.ckpt`` exists (saved via ``save_last=True``).  In that case
+        we return ``last.ckpt`` so eval does not fail with FileNotFoundError.
         """
         # look for ckpt files
         log_dir = os.path.join(self.experiment_config['checkpoint_dir'], 'checkpoints')
         ckpts = [f for f in os.listdir(log_dir) if f.endswith('.ckpt')]
 
-        # extract loss
-        loss = [float(re.match(r"epoch=\d{1,3}-\w{3,10}_loss=([-, \.,\d]{1,30}).ckpt", ckpt).group(1)) for ckpt in ckpts]
-        # look for min loss
-        ckpt_path = os.path.join(log_dir, ckpts[np.argmin(loss)])
+        # Try to match val-loss ckpt names; fall back to last.ckpt
+        _pat = re.compile(r"epoch=\d{1,3}-\w{3,10}_loss=([-, \.,\d]{1,30}).ckpt")
+        scored = [(f, float(m.group(1))) for f in ckpts if (m := _pat.match(f))]
+        if scored:
+            # look for min loss
+            ckpt_path = os.path.join(log_dir, min(scored, key=lambda x: x[1])[0])
+        elif "last.ckpt" in ckpts:
+            # val_loss not logged (empty val_dataloader) — use last saved epoch
+            ckpt_path = os.path.join(log_dir, "last.ckpt")
+        else:
+            raise FileNotFoundError(
+                f"No val-loss checkpoints and no last.ckpt found in {log_dir}. "
+                f"Files: {ckpts}"
+            )
         return ckpt_path
     
     def get_args(self):

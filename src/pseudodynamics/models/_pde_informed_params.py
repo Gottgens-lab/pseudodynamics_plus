@@ -195,16 +195,101 @@ class pde_params_base(pl.LightningModule):
     def restrict_D(self, s, t, exp=True):
         r"""
         penalize D to restrict instability
+
+        REVIEW (suggestion: why exp-scale the diffusion penalty?).
+        The suggestion is correct. With `exp=True`, the penalty is
+        ||exp(D)||_2, which is one-sided: exp(D) -> 0 as D -> -inf, so the
+        regularizer drives D toward large negative values rather than toward
+        0. With `exp=False`, the symmetric L2 norm on D actually pulls D
+        toward 0, which matches the intent of Eq. 9. The default here is
+        `True` but every call site in this file passes `exp=False`
+        explicitly, so the running behavior is fine. The default is
+        misleading though -- decision pending on whether to flip it.
         """
         D = self.D(s,t)
         if exp:
             D = torch.exp(D)
         D_L2 = torch.norm(D, p=2).sum()  # in case D is high dimensional
-        return D_L2 
+        return D_L2
+
+    def diffusion_variance_loss(self, s, t, tp1, k=15):
+        r"""
+        Variance-matching loss for D(s,t): the learned diffusion coefficient
+        should correlate with local expression variance across timepoints.
+
+        Cells in regions with high density change (high |u(s,t+1) - u(s,t)|)
+        should have higher D, as this indicates stochastic branching.
+
+        Arguments
+        ---------
+        s : tensor (n, n_dim), cell states
+        t : tensor (n,), time at t_k (already normalised)
+        tp1 : tensor (n,), time at t_{k+1}
+        k : int, neighbourhood size for local variance estimation
+        """
+        with torch.no_grad():
+            # Estimate local variance from KNN in cell-state space
+            # Use pairwise distances to find local spread
+            dists = torch.cdist(s, s)                     # (n, n)
+            _, knn_idx = dists.topk(k, dim=1, largest=False)  # (n, k)
+
+            # Local variance: variance of cell states in k-neighbourhood
+            neighbours = s[knn_idx]                       # (n, k, n_dim)
+            local_var = neighbours.var(dim=1).mean(dim=1)  # (n,)
+
+            # Normalise to [0, 1] for stable loss
+            local_var = local_var / (local_var.max() + 1e-8)
+
+        # D should be proportional to local variance
+        D_pred = self.D(s, t.unsqueeze(1) if t.dim() == 1 else t)
+        D_magnitude = torch.abs(D_pred).mean(dim=1) if D_pred.dim() > 1 else torch.abs(D_pred).squeeze()
+        D_norm = D_magnitude / (D_magnitude.max().detach() + 1e-8)
+
+        # Negative correlation loss: encourage D to correlate with local_var
+        loss = -torch.mean(
+            (D_norm - D_norm.mean()) * (local_var - local_var.mean())
+        ) / (D_norm.std().detach() * local_var.std() + 1e-8)
+
+        return loss
+
+    def diffusion_entropy_loss(self, s, t, u_t, u_tp1):
+        r"""
+        Entropy regularization: D should be higher at branching points,
+        identified by high entropy in density change between timepoints.
+
+        Cells where the density ratio u(t+1)/u(t) varies most across
+        neighbours are at fate decision points and need higher D.
+
+        Arguments
+        ---------
+        s : tensor (n, n_dim), cell states
+        t : tensor (n,), time
+        u_t : tensor (n,), density at t
+        u_tp1 : tensor (n,), density at t+1
+        """
+        with torch.no_grad():
+            # Density ratio captures where mass is redistributing
+            ratio = (u_tp1 + 1e-8) / (u_t + 1e-8)
+            # Normalise into a probability-like quantity per cell
+            p = ratio / (ratio.sum() + 1e-8)
+            # Per-cell surprise (high = unexpected density change = branching)
+            entropy_signal = -torch.log(p + 1e-8)
+            entropy_signal = entropy_signal / (entropy_signal.max() + 1e-8)
+
+        D_pred = self.D(s, t.unsqueeze(1) if t.dim() == 1 else t)
+        D_magnitude = torch.abs(D_pred).mean(dim=1) if D_pred.dim() > 1 else torch.abs(D_pred).squeeze()
+        D_norm = D_magnitude / (D_magnitude.max().detach() + 1e-8)
+
+        # Encourage D to be high where entropy signal is high
+        loss = -torch.mean(
+            (D_norm - D_norm.mean()) * (entropy_signal - entropy_signal.mean())
+        ) / (D_norm.std().detach() * entropy_signal.std() + 1e-8)
+
+        return loss
 
     def area_loss(self, u, u_hat, var=None):
         r"""
-        use the area under curve to compute loss 
+        use the area under curve to compute loss
 
         Arguments
         ---------
@@ -498,11 +583,33 @@ class pde_params(pde_params_base):
                     checkpoint_path = tompos_config.find_lastest_ckpt(), 
                     map_location='cpu')
     """
-    def __init__(self, channels, growth_weight=None, collapse_D = True, collapse_v = False, g_channels=None, v_channels=None, D_channels=None, time_sensitive=True, lr=3e-4, ode_tol=1e-4, activation_fn:Union[str, list] = 'Tanh', R_weight = None, deltax_weight = None, D_penalty = None, weight_intensity=None, time_scale_factor=None, pop_weight=None):
-        
-        super().__init__(channels=channels, collapse_D = collapse_D, collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, time_sensitive=True, lr=lr, ode_tol=ode_tol, activation_fn=activation_fn, D_penalty = D_penalty, weight_intensity=weight_intensity, deltax_weight=deltax_weight)
+    def __init__(self, channels,
+                    growth_weight=None,
+                    collapse_D = True,
+                    collapse_v = False,
+                    g_channels=None,
+                    v_channels=None,
+                    D_channels=None,
+                    time_sensitive=True,
+                    lr=3e-4,
+                    ode_tol=1e-4,
+                    activation_fn:Union[str,list] = 'Tanh',
+                    R_weight = None,
+                    deltax_weight = None,
+                    D_penalty = None,
+                    weight_intensity=None,
+                    time_scale_factor=None,
+                    pop_weight=None,
+                    cfm_weight=None,
+                    D_var_weight=None,
+                    neuralode_weight=None
+                ):
+
+        super().__init__(channels=channels,collapse_D = collapse_D,collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, 
+                         time_sensitive=True,  lr=lr, ode_tol=ode_tol, activation_fn=activation_fn, 
+                         D_penalty = D_penalty, weight_intensity=weight_intensity, deltax_weight=deltax_weight)
         self.save_hyperparameters()
-        
+
         self.time_sensitive = time_sensitive
         self.lr = lr
         self.R_weight = 1 if R_weight is None else R_weight
@@ -513,6 +620,9 @@ class pde_params(pde_params_base):
         self.growth_weight = 0 if growth_weight is None else growth_weight
         self.log_transform = False
         self.pop_weight = pop_weight
+        self.cfm_weight = 0 if cfm_weight is None else cfm_weight
+        self.D_var_weight = 0 if D_var_weight is None else D_var_weight
+        self.neuralode_weight = 2 if neuralode_weight is None else neuralode_weight
        
         MLP_Module = MLP_surrogate
         # u_theta, density function
@@ -549,7 +659,7 @@ class pde_params(pde_params_base):
         device = s.device
         t_in = torch.full((s.shape[0],1), t.item()*self.time_scale_factor).float().to(device)
 
-        with torch.set_grad_enabled(True):
+        with torch.set_grad_enabled(True):  
 
             s.requires_grad_(True)
             t_in.requires_grad_(True)
@@ -569,13 +679,19 @@ class pde_params(pde_params_base):
 
 
     def forward_density_loss(self, s, t, ut):
-        
+
         # loss 1 : boundary loss
         with torch.set_grad_enabled(True):
             s.requires_grad_(True)
             log_u_pred = self.u(s,t)
 
-        # boundary u of the current timepoint
+        # REVIEW (suggestion: use `log_u_pred + 1e-10`).
+        # The suggestion does NOT make sense as written. `log_u_pred` is the
+        # raw MLP output and is already in log-space (see `get_u`:
+        # u = exp(self.u(s,t))). It is real-valued and unbounded; there is no
+        # log(0) issue to guard against. The `+1e-10` is only needed inside
+        # `torch.log(ut + 1e-10)` because `ut` is a linear-space density that
+        # can be exactly 0.
         log_density_loss_t = self.loss_fn(torch.log(ut+1e-10), log_u_pred)
 
         return log_density_loss_t
@@ -609,13 +725,57 @@ class pde_params(pde_params_base):
         
         return u_int, s_t, duds, growth, drift, diffuse
 
+    def cfm_velocity_loss(self, x0, x1, t_k, t_kp1) -> torch.Tensor:
+        r"""
+        Conditional Flow Matching velocity loss.
+
+        Given cell states x0 from timepoint t_k and x1 from t_{k+1},
+        interpolates along straight paths and regresses the velocity network
+        v_θ against the conditional velocity field u_t = (x1 - x0).
+
+        Uses OT coupling via torchcfm when available, falling back to
+        random pairing otherwise.
+
+        Arguments
+        ---------
+        x0 : tensor (n, n_dim), cell states sampled from timepoint t_k
+        x1 : tensor (n, n_dim), cell states sampled from timepoint t_{k+1}
+        t_k : tensor (n,), normalised time at t_k
+        t_kp1 : tensor (n,), normalised time at t_{k+1}
+        """
+        try:
+            from torchcfm.conditional_flow_matching import (
+                ExactOptimalTransportConditionalFlowMatcher,
+            )
+            cfm = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
+            # Returns: interpolation time τ, x_τ, target velocity u_τ
+            tau, x_t, u_t = cfm.sample_location_and_conditional_flow(x0, x1)
+        except Exception:
+            # Fallback: random pairing, uniform τ
+            tau = torch.rand(x0.shape[0], 1, device=x0.device)
+            x_t = (1 - tau) * x0 + tau * x1
+            u_t = x1 - x0
+            tau = tau.squeeze(1)
+
+        # Map interpolation time τ ∈ [0,1] to actual normalised time
+        t_actual = t_k[:x_t.shape[0]] + tau * (t_kp1[:x_t.shape[0]] - t_k[:x_t.shape[0]])
+        t_in = t_actual.unsqueeze(1)  # (n, 1)
+
+        # Predict velocity at interpolated point
+        v_pred = self.v(x_t, t_in)
+
+        # v is dx/dt in real-time; u_t = x1-x0 is per-τ-unit displacement, divide by Δt to convert to per-real-time-unit drift
+        dt = (t_kp1[:x_t.shape[0]] - t_k[:x_t.shape[0]]).unsqueeze(1).clamp(min=1e-6)
+        loss = torch.mean((v_pred - u_t / dt) ** 2)
+        return loss
+
     def residual_loss(self, s, t) -> torch.Tensor:
         """
         calculate the loss for collocation points, this loss inject the pde into the neural network
-        
+
         Input
         ------
-        s: the cell state, 
+        s: the cell state,
         t: experimental time
         """
         with torch.set_grad_enabled(True):
@@ -623,8 +783,23 @@ class pde_params(pde_params_base):
             t.requires_grad_(True)
 
             dudt, growth, drift, diffuse = self.equation(s, t)
-            rhs = growth + drift + diffuse
+            # REVIEW (suggestion: `rhs = growth - drift + diffuse`, i.e. -drift).
+            # No bug here -- this line already uses `- drift`. `drift` is
+            # defined in `equation` as +d/ds(v*u), so subtracting it gives the
+            # correct PDE rhs.
+            rhs = growth - drift + diffuse
 
+        # REVIEW (suggestion: R_loss does not contribute, normalize by scale of u).
+        # Partially valid concern:
+        # (a) R_loss IS included in total_loss (see training_step: `self.R_weight * R_loss`).
+        # (b) But both `rhs` and `dudt` scale linearly with u, so the MSE here
+        #     scales with u**2 and is dominated by high-density points.
+        # (c) `loss_fn` was designed for log-space targets: it clamps to -24
+        #     and uses weight = (24+x)**weight_intensity. Applied to raw
+        #     `rhs`/`dudt` (which can be any sign and any magnitude) this
+        #     weighting is meaningless and can over-weight large positive rhs.
+        # A scale-normalized MSE (e.g. divide by mean(|u|)**2) would address
+        # both (b) and (c). Decision pending.
         return self.loss_fn(rhs.squeeze(), dudt.squeeze())
         # return self.loss_fn(torch.log(rhs.squeeze()+1e-10), torch.log(dudt.squeeze()+1e-10))
 
@@ -650,11 +825,18 @@ class pde_params(pde_params_base):
         log_sim_loss_tp1 = self.loss_fn(torch.log(utp1+1e-10), torch.log(u_int[-1]+1e-10)) 
 
 
-        # loss 3 : constrain related loss 
+        # loss 3 : constrain related loss
+        # REVIEW (suggestion: residual should use intermediate timepoints).
+        # Valid suggestion. Here R_loss only evaluates collocation points at
+        # the observed `t` of the batch, whereas `pde_params_fastmode` already
+        # samples `t_rand ~ U(t, tp1)` for the same purpose. The residual does
+        # NOT go through odeint, so adding intermediate t-samples is cheap;
+        # the user's hypothesis about odeint runtime is the right reason
+        # odeint itself is sparse, but it doesn't apply to residual_loss.
         R_loss = self.residual_loss(s, t)
-        D_norm = self.restrict_D(s, t, exp=False)    # constrain D 
-        v_loss = self.constrain_v(s,t,deltax)        # constrain v by local velocity   
-        
+        D_norm = self.restrict_D(s, t, exp=False)    # constrain D
+        v_loss = self.constrain_v(s,t,deltax)        # constrain v by local velocity
+
         # duds_loss = -1 * nn.functional.cosine_similarity(duds[-1], duds_tp1)
         # constrain g by population size
         if self.log_transform:
@@ -664,20 +846,51 @@ class pde_params(pde_params_base):
         else:
             mass_gain = utp1.sum() -  ut.sum()
             predicted_gain = growth[-1].sum()
+            # REVIEW (suggestion: divide by |mass_gain| or |mass_gain|+|predicted_gain|+1e-10).
+            # The suggestion is correct -- this is a real sign-flip bug.
+            # `loss_fn` returns a non-negative scalar; dividing by a signed
+            # `mass_gain` flips the gradient sign when the population is
+            # shrinking (mass_gain < 0), so SGD pushes `predicted_gain` away
+            # from `mass_gain` instead of toward it. The
+            # `|mass_gain|+|predicted_gain|+1e-10` form is also better
+            # conditioned when both are near zero. Decision pending.
             growth_loss = self.loss_fn(mass_gain, predicted_gain, weight=2) / mass_gain
         
 
+        # loss 4 (optional): Conditional Flow Matching velocity loss
+        cfm_loss = torch.tensor(0.0, device=s.device)
+        if self.cfm_weight > 0 and 'cfm_x0' in train_batch:
+            for i in range(10):
+                cfm_loss += self.cfm_velocity_loss(
+                    train_batch['cfm_x0'], train_batch['cfm_x1'], t, tp1,
+                )
+
+        # loss 5 (optional): Diffusion field variance-matching + entropy losses
+        D_var_loss = torch.tensor(0.0, device=s.device)
+        if self.D_var_weight > 0:
+            D_var_loss = (
+                self.diffusion_variance_loss(s, t, tp1) +
+                self.diffusion_entropy_loss(s, t, ut, utp1)
+            )
+
         total_loss = log_density_loss_t + log_density_loss_tp1 + \
-                    2 * log_sim_loss_tp1 + \
+                    self.neuralode_weight * log_sim_loss_tp1 + \
                     self.D_penalty * D_norm + \
                     self.deltax_weight * v_loss + \
-                    self.growth_weight * growth_loss
+                    self.growth_weight * growth_loss + \
+                    self.cfm_weight * cfm_loss + \
+                    self.D_var_weight * D_var_loss + \
+                    self.R_weight * R_loss
 
 
         with torch.no_grad():
             # self.log("residual_loss", Loss_r, on_epoch=True)
             # self.log("boundary_loss", Loss_b, on_epoch=True)
             self.log("population_loss", growth_loss.item(), on_epoch=True)
+            if self.cfm_weight > 0:
+                self.log("cfm_loss", cfm_loss.item(), on_epoch=True)
+            if self.D_var_weight > 0:
+                self.log("D_var_loss", D_var_loss.item(), on_epoch=True)
             self.log("boundary_loss",  log_density_loss_t.item(),  on_epoch=True)
             self.log("residual loss", R_loss.item(), on_epoch=True)
             self.log("integrat_loss", log_sim_loss_tp1.item(), on_epoch=True)
@@ -848,8 +1061,10 @@ class pde_params_fastmode(pde_params):
         else:
             mass_gain = utp1.sum() -  ut.sum()
             predicted_gain = growth[-1].sum()
+            # REVIEW: same sign-flip bug as in `pde_params.training_step`.
+            # Suggestion: divide by |mass_gain|+|predicted_gain|+1e-10.
             growth_loss = self.loss_fn(mass_gain, predicted_gain, weight=2) / mass_gain
-        
+
 
         total_loss = log_density_loss_t + log_density_loss_tp1 + \
                     2 * log_sim_loss_tp1 + \

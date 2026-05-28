@@ -44,7 +44,7 @@ optional_args.add_argument("--schedule_lr", type=str, required=False, default="C
 optional_args.add_argument("--n_grid", type=int, required=False, default=300, help='the number of grid or h to devid the cell state space')
 optional_args.add_argument("--n_dimension", type=int, required=False, default=5, help='the number of dimension to used for estimating density')
 optional_args.add_argument("--timepoint_idx", type=str, required=False, default=None, help='the number of time point to train the model')
-optional_args.add_argument("--knn_volume", type=str, required=False, default=False, help='Whether to correct single-cell density estimate with KNN distance')
+optional_args.add_argument("--knn_volume", required=False, default=False, help='Whether to correct single-cell density estimate with KNN distance')
 optional_args.add_argument("--batch_size", type=int, required=False, default=200, help='the number of nearby cell state to include within a minibatch')
 optional_args.add_argument("--bw", type=float, required=False, default=None, help='the band width parameter , pass to bw_method for gaussian_kde')
 optional_args.add_argument("--tol", type=float, required=False, default=1e-4, help='the tolerance of error , used to control the precision and speed of ode integral')
@@ -58,7 +58,13 @@ optional_args.add_argument("--growth_weight", type=float, required=False, defaul
 optional_args.add_argument("--time_scale_factor", type=float, required=False, default=5, help='the scale the time for ode')
 optional_args.add_argument("--norm_time", type=str, required=False, default=False, help='Ways to normlize the timepoint, [False, min_minus, log, none]')
 optional_args.add_argument("--time_sensitive", action="store_true", required=False, help='Whether to include time in behavoir functions')
+optional_args.add_argument("--cfm_weight", type=float, required=False, default=None, help='Weight for Conditional Flow Matching velocity loss (0 = disabled)')
+optional_args.add_argument("--D_var_weight", type=float, required=False, default=None, help='Weight for diffusion variance-matching + entropy losses (0 = disabled)')
+optional_args.add_argument("--neuralode_weight", type=float, required=False, default=None, help='Weight for the Neural-ODE simulation loss (default 2 to preserve previous behaviour)')
+optional_args.add_argument("--seed", type=int, required=False, default=None, help='Random seed for pl.seed_everything; if None no seed is set')
+optional_args.add_argument("--max_epochs", type=int, required=False, default=400, help='maximum training epochs (default 400)')
 optional_args.add_argument("--progress_bar", type=str, required=False, default="True", help='whether show progress bar on screen, boolen value, default True')
+optional_args.add_argument("--resume_ckpt", type=str, required=False, default=None, help='path to checkpoint to resume training from')
 
 args = parser.parse_args()
 
@@ -67,8 +73,18 @@ if args.config:
     # Load configuration and override arguments
     config = pseudodynamics.ExperimentConfig(config=args.config)
     gpu_devices = args.gpu_devices
+    seed_cli = args.seed
+    log_name_cli = args.log_name
+    progress_bar_cli = args.progress_bar
+    max_epochs_cli = args.max_epochs
     args = Namespace(**config.raw_args)
     args.gpu_devices = gpu_devices    # otherwise covered by the configged gpu devices
+    if seed_cli is not None:
+        args.seed = seed_cli
+    if log_name_cli is not None:
+        args.log_name = log_name_cli
+    args.progress_bar = progress_bar_cli
+    args.max_epochs = max_epochs_cli
     # config.raw_args['config'] = args.config   # Preserve original config path
 else:
     # Validate required arguments
@@ -78,6 +94,9 @@ else:
 # ... [Rest of data loading code remains the same] ...
 
 # Save path handling
+
+if getattr(args, 'seed', None) is not None:
+    pl.seed_everything(args.seed, workers=True)
 
 path = os.path.abspath(".")
 h5_path = os.path.join(path, f'{args.dataset}.h5ad')
@@ -129,13 +148,16 @@ model = model_class(
         channels = channels,
         activation_fn='Tanh',
         ode_tol = args.tol,
-        D_penalty = args.D_penalty, 
+        D_penalty = args.D_penalty,
         deltax_weight = args.deltax_weight,
         weight_intensity = args.weight_intensity,
         growth_weight = args.growth_weight,
         R_weight = args.R_weight,
         time_scale_factor = args.time_scale_factor,
         time_sensitive = args.time_sensitive,
+        cfm_weight = getattr(args, 'cfm_weight', None),
+        D_var_weight = getattr(args, 'D_var_weight', None),
+        neuralode_weight = getattr(args, 'neuralode_weight', None),
         **model_kws
     )
 
@@ -161,7 +183,7 @@ if args.pretrained is not None:
 ds_kws = dict(  timepoint_idx = args.timepoint_idx, 
                 n_dimension = args.n_dimension,
                 cellstate_key=args.cellstate_key,  #'DM_EigenVector'
-                knn_volume = eval(args.knn_volume),
+                knn_volume = eval(args.knn_volume) if isinstance(args.knn_volume, str) else args.knn_volume,
                 log_transform=False,
                 norm_time=args.norm_time,
                 deltax_key=args.deltax_key,
@@ -188,10 +210,16 @@ trainer = pl.Trainer(
                     # fast_dev_run=True,
                     # gradient_clip_val=0.5,
                     default_root_dir=save_path,
-                    devices = gpu_device, 
-                    max_epochs=400,
+                    devices = gpu_device,
+                    max_epochs=getattr(args, 'max_epochs', 400),
+                    # save_last=True guarantees a checkpoint even when val_dataloader
+                    # is empty (cord-blood PCA: val cells × 30 dims don't fill a
+                    # batch_size=1024 batch, so val_loss is never logged and
+                    # monitor="val_loss" would save nothing).  Klein is unaffected —
+                    # save_last adds a "last.ckpt" alongside the two best-val checkpoints.
                     callbacks=[callbacks.ModelCheckpoint(filename='{epoch}-{val_loss:.8f}',
-                                                monitor="val_loss", mode="min", save_top_k=2)]
+                                                monitor="val_loss", mode="min", save_top_k=2,
+                                                save_last=True)]
                     )
 
 
@@ -210,4 +238,5 @@ config_run.save(os.path.join(save_path, f'V{version}_config.json'))
 
 
 
-trainer.fit(model, train_dataloaders=train_DL,val_dataloaders=val_DL)
+trainer.fit(model, train_dataloaders=train_DL, val_dataloaders=val_DL,
+            ckpt_path=getattr(args, 'resume_ckpt', None))
