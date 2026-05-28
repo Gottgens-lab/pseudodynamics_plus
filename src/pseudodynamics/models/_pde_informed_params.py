@@ -195,12 +195,22 @@ class pde_params_base(pl.LightningModule):
     def restrict_D(self, s, t, exp=True):
         r"""
         penalize D to restrict instability
+
+        REVIEW (suggestion: why exp-scale the diffusion penalty?).
+        The suggestion is correct. With `exp=True`, the penalty is
+        ||exp(D)||_2, which is one-sided: exp(D) -> 0 as D -> -inf, so the
+        regularizer drives D toward large negative values rather than toward
+        0. With `exp=False`, the symmetric L2 norm on D actually pulls D
+        toward 0, which matches the intent of Eq. 9. The default here is
+        `True` but every call site in this file passes `exp=False`
+        explicitly, so the running behavior is fine. The default is
+        misleading though -- decision pending on whether to flip it.
         """
         D = self.D(s,t)
         if exp:
             D = torch.exp(D)
         D_L2 = torch.norm(D, p=2).sum()  # in case D is high dimensional
-        return D_L2 
+        return D_L2
 
     def diffusion_variance_loss(self, s, t, tp1, k=15):
         r"""
@@ -669,13 +679,19 @@ class pde_params(pde_params_base):
 
 
     def forward_density_loss(self, s, t, ut):
-        
+
         # loss 1 : boundary loss
         with torch.set_grad_enabled(True):
             s.requires_grad_(True)
             log_u_pred = self.u(s,t)
 
-        # boundary u of the current timepoint
+        # REVIEW (suggestion: use `log_u_pred + 1e-10`).
+        # The suggestion does NOT make sense as written. `log_u_pred` is the
+        # raw MLP output and is already in log-space (see `get_u`:
+        # u = exp(self.u(s,t))). It is real-valued and unbounded; there is no
+        # log(0) issue to guard against. The `+1e-10` is only needed inside
+        # `torch.log(ut + 1e-10)` because `ut` is a linear-space density that
+        # can be exactly 0.
         log_density_loss_t = self.loss_fn(torch.log(ut+1e-10), log_u_pred)
 
         return log_density_loss_t
@@ -756,10 +772,10 @@ class pde_params(pde_params_base):
     def residual_loss(self, s, t) -> torch.Tensor:
         """
         calculate the loss for collocation points, this loss inject the pde into the neural network
-        
+
         Input
         ------
-        s: the cell state, 
+        s: the cell state,
         t: experimental time
         """
         with torch.set_grad_enabled(True):
@@ -767,8 +783,23 @@ class pde_params(pde_params_base):
             t.requires_grad_(True)
 
             dudt, growth, drift, diffuse = self.equation(s, t)
+            # REVIEW (suggestion: `rhs = growth - drift + diffuse`, i.e. -drift).
+            # No bug here -- this line already uses `- drift`. `drift` is
+            # defined in `equation` as +d/ds(v*u), so subtracting it gives the
+            # correct PDE rhs.
             rhs = growth - drift + diffuse
 
+        # REVIEW (suggestion: R_loss does not contribute, normalize by scale of u).
+        # Partially valid concern:
+        # (a) R_loss IS included in total_loss (see training_step: `self.R_weight * R_loss`).
+        # (b) But both `rhs` and `dudt` scale linearly with u, so the MSE here
+        #     scales with u**2 and is dominated by high-density points.
+        # (c) `loss_fn` was designed for log-space targets: it clamps to -24
+        #     and uses weight = (24+x)**weight_intensity. Applied to raw
+        #     `rhs`/`dudt` (which can be any sign and any magnitude) this
+        #     weighting is meaningless and can over-weight large positive rhs.
+        # A scale-normalized MSE (e.g. divide by mean(|u|)**2) would address
+        # both (b) and (c). Decision pending.
         return self.loss_fn(rhs.squeeze(), dudt.squeeze())
         # return self.loss_fn(torch.log(rhs.squeeze()+1e-10), torch.log(dudt.squeeze()+1e-10))
 
@@ -794,11 +825,18 @@ class pde_params(pde_params_base):
         log_sim_loss_tp1 = self.loss_fn(torch.log(utp1+1e-10), torch.log(u_int[-1]+1e-10)) 
 
 
-        # loss 3 : constrain related loss 
+        # loss 3 : constrain related loss
+        # REVIEW (suggestion: residual should use intermediate timepoints).
+        # Valid suggestion. Here R_loss only evaluates collocation points at
+        # the observed `t` of the batch, whereas `pde_params_fastmode` already
+        # samples `t_rand ~ U(t, tp1)` for the same purpose. The residual does
+        # NOT go through odeint, so adding intermediate t-samples is cheap;
+        # the user's hypothesis about odeint runtime is the right reason
+        # odeint itself is sparse, but it doesn't apply to residual_loss.
         R_loss = self.residual_loss(s, t)
-        D_norm = self.restrict_D(s, t, exp=False)    # constrain D 
-        v_loss = self.constrain_v(s,t,deltax)        # constrain v by local velocity   
-        
+        D_norm = self.restrict_D(s, t, exp=False)    # constrain D
+        v_loss = self.constrain_v(s,t,deltax)        # constrain v by local velocity
+
         # duds_loss = -1 * nn.functional.cosine_similarity(duds[-1], duds_tp1)
         # constrain g by population size
         if self.log_transform:
@@ -808,6 +846,14 @@ class pde_params(pde_params_base):
         else:
             mass_gain = utp1.sum() -  ut.sum()
             predicted_gain = growth[-1].sum()
+            # REVIEW (suggestion: divide by |mass_gain| or |mass_gain|+|predicted_gain|+1e-10).
+            # The suggestion is correct -- this is a real sign-flip bug.
+            # `loss_fn` returns a non-negative scalar; dividing by a signed
+            # `mass_gain` flips the gradient sign when the population is
+            # shrinking (mass_gain < 0), so SGD pushes `predicted_gain` away
+            # from `mass_gain` instead of toward it. The
+            # `|mass_gain|+|predicted_gain|+1e-10` form is also better
+            # conditioned when both are near zero. Decision pending.
             growth_loss = self.loss_fn(mass_gain, predicted_gain, weight=2) / mass_gain
         
 
@@ -1015,8 +1061,10 @@ class pde_params_fastmode(pde_params):
         else:
             mass_gain = utp1.sum() -  ut.sum()
             predicted_gain = growth[-1].sum()
+            # REVIEW: same sign-flip bug as in `pde_params.training_step`.
+            # Suggestion: divide by |mass_gain|+|predicted_gain|+1e-10.
             growth_loss = self.loss_fn(mass_gain, predicted_gain, weight=2) / mass_gain
-        
+
 
         total_loss = log_density_loss_t + log_density_loss_tp1 + \
                     2 * log_sim_loss_tp1 + \

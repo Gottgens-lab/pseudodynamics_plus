@@ -54,6 +54,17 @@ class AnnDataset(Dataset):
         #     self.popD['mean'] = np.log(mu)
         #     self.popD['var'] = self.popD['var']/ mu
         # else:
+        # Backfill 'var' from 'std' when only 'std' is provided. The notebook
+        # tutorial documents the {t, mean, std, n_lib} schema, so this lets
+        # data prepared from the tutorial work without a separate 'var' key.
+        if 'var' not in self.popD:
+            if 'std' in self.popD:
+                self.popD['var'] = np.asarray(self.popD['std']) ** 2
+            else:
+                raise KeyError(
+                    "adata.uns['pop'] must contain 'var' or 'std' "
+                    "(var will be inferred as std**2 if absent)."
+                )
         N0 = self.popD['mean'][0]
         self.popD['mean'] = self.popD['mean'] / N0
         self.popD['var'] = self.popD['var']/ N0
