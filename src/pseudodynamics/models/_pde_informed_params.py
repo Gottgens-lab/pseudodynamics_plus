@@ -124,7 +124,21 @@ class pde_params_base(pl.LightningModule):
         return prod
 
     def gradient_of(self, out, variable):
-        return torch.autograd.grad(out, variable, create_graph=True, allow_unused=True)[0] 
+        return torch.autograd.grad(out, variable, create_graph=True, allow_unused=True)[0]
+
+    def D_forward(self, s, t):
+        r"""
+        Diffusion-net output, optionally hard-clamped into ``self.D_clip``.
+
+        Opt-in via the ``--D_clip lo,hi`` flag (used for the GRN-3D experiment).
+        When ``self.D_clip`` is None (the default) this returns the raw network
+        output, so existing behaviour is unchanged.
+        """
+        out = self.D(s, t)
+        clip = getattr(self, 'D_clip', None)
+        if clip is not None:
+            out = out.clamp(min=clip[0], max=clip[1])
+        return out
 
     def equation(self, s, t) -> tuple:
         """
@@ -136,7 +150,7 @@ class pde_params_base(pl.LightningModule):
         we calcuate the left hand side (lhs) and the right hand side
         """
         u = self.get_u(s,t) # make sure it is u
-        D = self.D(s,t)
+        D = self.D_forward(s,t)
         v = self.v(s,t)
         g = self.g(s,t)
         
@@ -474,7 +488,7 @@ class pde_params_base(pl.LightningModule):
 
                 v_pred = self.v(s_in, t_in)
                 g_pred = self.g(s_in, t_in)
-                D_pred = self.D(s_in, t_in)
+                D_pred = self.D_forward(s_in, t_in)
                 
                 v_ls.append(v_pred.detach().cpu().numpy())
                 g_ls.append(g_pred.detach().cpu().numpy())
@@ -603,7 +617,8 @@ class pde_params(pde_params_base):
                     cfm_weight=None,
                     D_var_weight=None,
                     neuralode_weight=None,
-                    per_cell_growth_loss=False
+                    per_cell_growth_loss=False,
+                    D_clip=None
                 ):
 
         super().__init__(channels=channels,collapse_D = collapse_D,collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, 
@@ -627,6 +642,19 @@ class pde_params(pde_params_base):
         # Opt-in: per-cell mass match (DeepRUOT-style) instead of summed total.
         # Default False preserves original behaviour.
         self.per_cell_growth_loss = bool(per_cell_growth_loss)
+        # Opt-in: hard-clamp the diffusion field into (lo, hi) wherever D enters
+        # the PDE dynamics (GRN-3D experiment). Default None preserves original
+        # behaviour. Accepts "lo,hi" (CLI/config string) or a (lo, hi) sequence.
+        if D_clip is None:
+            self.D_clip = None
+        else:
+            parts = [p for p in D_clip.split(",") if p.strip() != ""] if isinstance(D_clip, str) else list(D_clip)
+            if len(parts) != 2:
+                raise ValueError(f"D_clip must be 'lo,hi' (exactly two values); got {D_clip!r}")
+            _lo, _hi = float(parts[0]), float(parts[1])
+            if _lo > _hi:
+                raise ValueError(f"D_clip lo ({_lo}) must be <= hi ({_hi})")
+            self.D_clip = (_lo, _hi)
        
         MLP_Module = MLP_surrogate
         # u_theta, density function
