@@ -618,7 +618,9 @@ class pde_params(pde_params_base):
                     D_var_weight=None,
                     neuralode_weight=None,
                     per_cell_growth_loss=False,
-                    D_clip=None
+                    D_clip=None,
+                    cfm_unbalanced_reg_m=None,
+                    g_init_rate=None
                 ):
 
         super().__init__(channels=channels,collapse_D = collapse_D,collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, 
@@ -655,6 +657,9 @@ class pde_params(pde_params_base):
             if _lo > _hi:
                 raise ValueError(f"D_clip lo ({_lo}) must be <= hi ({_hi})")
             self.D_clip = (_lo, _hi)
+        # Opt-in: use UNBALANCED OT (marginal relaxation reg_m) for the CFM velocity-loss
+        # pairing instead of balanced OT. None (default) -> balanced (original behaviour).
+        self.cfm_unbalanced_reg_m = None if cfm_unbalanced_reg_m is None else float(cfm_unbalanced_reg_m)
        
         MLP_Module = MLP_surrogate
         # u_theta, density function
@@ -664,6 +669,17 @@ class pde_params(pde_params_base):
         if g_channels  is None:
             g_channels = channels[:-1] + [1]
         self.g = MLP_Module(channels = g_channels, activation_fn=activation_fn, time_sensitive=time_sensitive)
+        # Opt-in: warm-start the growth net to a population-derived mean rate so g does not
+        # collapse toward 0. Sets the output-layer bias to g_init_rate and shrinks its weights,
+        # so g(x,t) ~= g_init_rate at init; the (per-cell) growth loss then shapes the
+        # spatial/temporal structure. Mirrors DeepRUOT's Phase-1 growth pretrain. Default None
+        # = standard init (original behaviour).
+        self.g_init_rate = None if g_init_rate is None else float(g_init_rate)
+        if self.g_init_rate is not None:
+            with torch.no_grad():
+                last_lin = [m for m in self.g.u_theta if isinstance(m, nn.Linear)][-1]
+                last_lin.weight.mul_(0.01)
+                last_lin.bias.fill_(self.g_init_rate)
 
         # if we choose to collapse v, that means the parameter is the same for all dimension
         if v_channels is None:
@@ -775,19 +791,47 @@ class pde_params(pde_params_base):
         t_k : tensor (n,), normalised time at t_k
         t_kp1 : tensor (n,), normalised time at t_{k+1}
         """
-        try:
-            from torchcfm.conditional_flow_matching import (
-                ExactOptimalTransportConditionalFlowMatcher,
-            )
-            cfm = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
-            # Returns: interpolation time τ, x_τ, target velocity u_τ
-            tau, x_t, u_t = cfm.sample_location_and_conditional_flow(x0, x1)
-        except Exception:
-            # Fallback: random pairing, uniform τ
-            tau = torch.rand(x0.shape[0], 1, device=x0.device)
-            x_t = (1 - tau) * x0 + tau * x1
-            u_t = x1 - x0
+        reg_m = getattr(self, 'cfm_unbalanced_reg_m', None)
+        if reg_m is not None:
+            # Opt-in: pair x0,x1 by UNBALANCED OT (marginal relaxation reg_m) instead of
+            # balanced OT. With population growth the balanced coupling forces every t_k cell
+            # into the growth-reshaped t_{k+1} cloud (apparent flow toward high-growth regions);
+            # unbalanced coupling lets that extra mass be "created", so the sampled pairs carry
+            # the true velocity. (See R1.1 divided-5D: balanced cos 0.72 -> unbalanced 0.90.)
+            try:
+                import ot as _ot
+                x0n = x0.detach().cpu().numpy().astype('float64')
+                x1n = x1.detach().cpu().numpy().astype('float64')
+                n0, n1 = x0n.shape[0], x1n.shape[0]
+                M = _ot.dist(x0n, x1n, metric='sqeuclidean'); M = M / (M.mean() + 1e-9)
+                P = _ot.unbalanced.sinkhorn_unbalanced(
+                    np.ones(n0) / n0, np.ones(n1) / n1, M, 0.05, float(reg_m), numItermax=100)
+                Pf = P.flatten().astype('float64'); ssum = Pf.sum()
+                assert np.isfinite(ssum) and ssum > 0
+                sel = np.random.choice(Pf.shape[0], size=n0, p=Pf / ssum)
+                idx0, idx1 = sel // n1, sel % n1
+            except Exception:
+                idx0 = np.arange(x0.shape[0])
+                idx1 = np.random.randint(x1.shape[0], size=x0.shape[0])
+            x0p, x1p = x0[idx0], x1[idx1]
+            tau = torch.rand(x0p.shape[0], 1, device=x0.device)
+            x_t = (1 - tau) * x0p + tau * x1p
+            u_t = x1p - x0p
             tau = tau.squeeze(1)
+        else:
+            try:
+                from torchcfm.conditional_flow_matching import (
+                    ExactOptimalTransportConditionalFlowMatcher,
+                )
+                cfm = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
+                # Returns: interpolation time τ, x_τ, target velocity u_τ
+                tau, x_t, u_t = cfm.sample_location_and_conditional_flow(x0, x1)
+            except Exception:
+                # Fallback: random pairing, uniform τ
+                tau = torch.rand(x0.shape[0], 1, device=x0.device)
+                x_t = (1 - tau) * x0 + tau * x1
+                u_t = x1 - x0
+                tau = tau.squeeze(1)
 
         # Map interpolation time τ ∈ [0,1] to actual normalised time
         t_actual = t_k[:x_t.shape[0]] + tau * (t_kp1[:x_t.shape[0]] - t_k[:x_t.shape[0]])
