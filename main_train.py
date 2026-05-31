@@ -61,10 +61,13 @@ optional_args.add_argument("--time_sensitive", action="store_true", required=Fal
 optional_args.add_argument("--cfm_weight", type=float, required=False, default=None, help='Weight for Conditional Flow Matching velocity loss (0 = disabled)')
 optional_args.add_argument("--D_var_weight", type=float, required=False, default=None, help='Weight for diffusion variance-matching + entropy losses (0 = disabled)')
 optional_args.add_argument("--neuralode_weight", type=float, required=False, default=None, help='Weight for the Neural-ODE simulation loss (default 2 to preserve previous behaviour)')
-optional_args.add_argument("--per_cell_growth_loss", action="store_true", required=False, help='Use per-cell DeepRUOT-style mass-flow supervision for the growth loss (default: original .sum()-based version)')
 optional_args.add_argument("--D_clip", type=str, required=False, default=None, help='Hard-clamp the diffusion field into "lo,hi" (e.g. "-0.05,0.05") in the PDE dynamics; opt-in, default off')
 optional_args.add_argument("--cfm_unbalanced_reg_m", type=float, required=False, default=None, help='If set, use unbalanced OT (marginal relaxation reg_m) for the CFM velocity-loss pairing instead of balanced OT; opt-in, default off (balanced)')
 optional_args.add_argument("--g_init_rate", type=float, required=False, default=None, help='If set, warm-start the growth net so g(x,t) ~= this value at init (e.g. the population-derived mean rate ln(N_t+1/N_t)/dt); prevents g collapsing to 0. Opt-in, default off (standard init)')
+optional_args.add_argument("--growth_loss_mode", type=str, required=False, default='logratio', choices=['legacy', 'logratio', 'massbalance'], help='Growth-loss formulation: "logratio" (default) constrains d ln N/dt = E[g] (scale-free); "massbalance" matches N_t + integral(g*u_int) to N_t+1 in log space (pop-scaled neural-ODE density); "legacy" = original .sum()-based loss. Pin "legacy" to reproduce earlier runs.')
+optional_args.add_argument("--growth_pop_ref", type=str, required=False, default='cellsum', choices=['cellsum', 'popmean'], help='Reference for observed N_t+1/N_t in the growth loss: "cellsum" (batch cell-sum ratio, default) or "popmean" (true pop ratio from uns, open-system anchor)')
+optional_args.add_argument("--num_workers", type=int, required=False, default=10, help='DataLoader worker processes (default 10)')
+optional_args.add_argument("--residual_mode", type=str, required=False, default='raw', choices=['raw', 'ginv'], help='FP residual formulation: "raw" (default, u**2-scaled MSE) or "ginv" (normalize by u -> supervises g via the continuity inversion g=(du/dt+div(vu)-div(D grad u))/u; scale-free, use a moderate R_weight)')
 optional_args.add_argument("--density_estimator", type=str, required=False, default="kde", choices=["kde", "gmm"], help='Density estimator for u_obs: "kde" (default, scipy.stats.gaussian_kde) or "gmm" (sklearn GaussianMixture with BIC-selected k)')
 optional_args.add_argument("--gmm_k_max", type=int, required=False, default=5, help='Max number of GMM components to test by BIC when --density_estimator=gmm (default 5)')
 optional_args.add_argument("--seed", type=int, required=False, default=None, help='Random seed for pl.seed_everything; if None no seed is set')
@@ -164,10 +167,12 @@ model = model_class(
         cfm_weight = getattr(args, 'cfm_weight', None),
         D_var_weight = getattr(args, 'D_var_weight', None),
         neuralode_weight = getattr(args, 'neuralode_weight', None),
-        per_cell_growth_loss = getattr(args, 'per_cell_growth_loss', False),
         D_clip = getattr(args, 'D_clip', None),
         cfm_unbalanced_reg_m = getattr(args, 'cfm_unbalanced_reg_m', None),
         g_init_rate = getattr(args, 'g_init_rate', None),
+        growth_loss_mode = getattr(args, 'growth_loss_mode', 'logratio'),
+        growth_pop_ref = getattr(args, 'growth_pop_ref', 'cellsum'),
+        residual_mode = getattr(args, 'residual_mode', 'raw'),
         **model_kws
     )
 
@@ -234,8 +239,9 @@ if getattr(args, 'density_estimator', 'kde') == 'gmm':
 
 train_DS = reader.TwoTimpepoint_AnnDS(AnnData=adata, split='train', **ds_kws)
 val_DS = reader.TwoTimpepoint_AnnDS(AnnData=adata, split='val', **ds_kws)
-train_DL = DataLoader(train_DS, batch_size=None, num_workers=10)
-val_DL = DataLoader(val_DS, batch_size=None, num_workers=10)
+_nw = getattr(args, 'num_workers', 10)
+train_DL = DataLoader(train_DS, batch_size=None, num_workers=_nw)
+val_DL = DataLoader(val_DS, batch_size=None, num_workers=_nw)
 ##############################
 ##      set up trainer      ##
 ##############################

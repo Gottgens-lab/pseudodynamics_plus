@@ -617,10 +617,12 @@ class pde_params(pde_params_base):
                     cfm_weight=None,
                     D_var_weight=None,
                     neuralode_weight=None,
-                    per_cell_growth_loss=False,
                     D_clip=None,
                     cfm_unbalanced_reg_m=None,
-                    g_init_rate=None
+                    g_init_rate=None,
+                    growth_loss_mode='logratio',
+                    growth_pop_ref='cellsum',
+                    residual_mode='raw'
                 ):
 
         super().__init__(channels=channels,collapse_D = collapse_D,collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, 
@@ -641,9 +643,23 @@ class pde_params(pde_params_base):
         self.cfm_weight = 0 if cfm_weight is None else cfm_weight
         self.D_var_weight = 0 if D_var_weight is None else D_var_weight
         self.neuralode_weight = 2 if neuralode_weight is None else neuralode_weight
-        # Opt-in: per-cell mass match (DeepRUOT-style) instead of summed total.
-        # Default False preserves original behaviour.
-        self.per_cell_growth_loss = bool(per_cell_growth_loss)
+        # Growth-loss formulation (see training_step). 'logratio' (default): scale-free
+        # d ln N/dt = E_p[g]. 'massbalance': N_t + ∫∫ g·u_int matched to N_{t+1} in log space
+        # using the pop-scaled neural-ODE density. 'legacy': original .sum()/log-transform path.
+        # 'growth_pop_ref' chooses the observed reference for N_{t+1}/N_t: 'cellsum' (batch cell
+        # sums, self-normalising) or 'popmean' (the true pop_mean ratio carried in the batch).
+        self.growth_loss_mode = (growth_loss_mode or 'logratio')
+        self.growth_pop_ref = (growth_pop_ref or 'cellsum')
+        assert self.growth_loss_mode in ('legacy', 'logratio', 'massbalance'), \
+            f"growth_loss_mode must be legacy|logratio|massbalance, got {self.growth_loss_mode!r}"
+        assert self.growth_pop_ref in ('cellsum', 'popmean'), \
+            f"growth_pop_ref must be cellsum|popmean, got {self.growth_pop_ref!r}"
+        # Opt-in: normalize the FP residual by u so it supervises g directly (the
+        # g = rhs/u continuity inversion), scale-free, instead of the raw u**2-scaled
+        # MSE. Default 'raw' preserves original behaviour.
+        self.residual_mode = (residual_mode or 'raw')
+        assert self.residual_mode in ('raw', 'ginv'), \
+            f"residual_mode must be raw|ginv, got {self.residual_mode!r}"
         # Opt-in: hard-clamp the diffusion field into (lo, hi) wherever D enters
         # the PDE dynamics (GRN-3D experiment). Default None preserves original
         # behaviour. Accepts "lo,hi" (CLI/config string) or a (lo, hi) sequence.
@@ -859,23 +875,22 @@ class pde_params(pde_params_base):
             t.requires_grad_(True)
 
             dudt, growth, drift, diffuse = self.equation(s, t)
-            # REVIEW (suggestion: `rhs = growth - drift + diffuse`, i.e. -drift).
-            # No bug here -- this line already uses `- drift`. `drift` is
-            # defined in `equation` as +d/ds(v*u), so subtracting it gives the
-            # correct PDE rhs.
+            if self.residual_mode == 'ginv':
+                assert not self.log_transform, \
+                    "residual_mode='ginv' requires a linear-density model (log_transform=False); " \
+                    "for log-density models dudt and get_u are in different spaces."
+                # Normalized residual = residual / u = g - g_target, with
+                # g_target = (du/dt + div(vu) - div(D grad u)) / u, the continuity-
+                # implied growth rate. Scale-free (O(g)), weights every cell equally,
+                # and supervises g directly. Target detached so only g learns from it
+                # (u, v, D stay fixed by their own losses -> protects the CFM velocity).
+                # u floored to avoid 1/u blow-up in the lowest-density cells.
+                u = self.get_u(s, t).reshape(-1)
+                u_safe = u.clamp(min=(u.mean() * 1e-2).clamp(min=1e-9))
+                g_target = ((dudt + drift - diffuse).reshape(-1) / u_safe).detach()
+                g_pred = self.g(s, t).reshape(-1)
+                return torch.mean((g_pred - g_target) ** 2)
             rhs = growth - drift + diffuse
-
-        # REVIEW (suggestion: R_loss does not contribute, normalize by scale of u).
-        # Partially valid concern:
-        # (a) R_loss IS included in total_loss (see training_step: `self.R_weight * R_loss`).
-        # (b) But both `rhs` and `dudt` scale linearly with u, so the MSE here
-        #     scales with u**2 and is dominated by high-density points.
-        # (c) `loss_fn` was designed for log-space targets: it clamps to -24
-        #     and uses weight = (24+x)**weight_intensity. Applied to raw
-        #     `rhs`/`dudt` (which can be any sign and any magnitude) this
-        #     weighting is meaningless and can over-weight large positive rhs.
-        # A scale-normalized MSE (e.g. divide by mean(|u|)**2) would address
-        # both (b) and (c). Decision pending.
         return self.loss_fn(rhs.squeeze(), dudt.squeeze())
         # return self.loss_fn(torch.log(rhs.squeeze()+1e-10), torch.log(dudt.squeeze()+1e-10))
 
@@ -915,15 +930,48 @@ class pde_params(pde_params_base):
 
         # duds_loss = -1 * nn.functional.cosine_similarity(duds[-1], duds_tp1)
         # constrain g by population size
-        if self.per_cell_growth_loss:
-            # Per-cell DeepRUOT-style mass-flow supervision.
-            # Match per-cell observed mass change (utp1 - ut) to per-cell
-            # predicted integrated growth (growth[-1]). Preserves spatial
-            # supervision instead of collapsing via .sum(). Each cell becomes
-            # an independent constraint, giving g_net dense gradient signal.
-            mass_gain_per_cell = utp1 - ut
-            predicted_gain_per_cell = growth[-1]
-            growth_loss = self.loss_fn(predicted_gain_per_cell, mass_gain_per_cell, weight=2)
+        if self.growth_loss_mode == 'logratio':
+            # d ln N/dt = E_p[g]  =>  log(N_{t+1}/N_t) = ∫ E[g] dτ  (trapezoid over the
+            # interval). Scale-free: depends only on g averaged over the batch cells, not on
+            # the absolute scale of the free density net, so g can no longer hide behind a
+            # mis-scaled u. Globally the transport terms integrate to zero (divergence
+            # theorem), so total mass gain == total growth.
+            # g_net = time_scale_factor * g_real (the ODE integrates in scaled time, and
+            # predict_param divides g by time_scale_factor), so the real-time interval is
+            # dt_real / time_scale_factor.
+            dt_g = (tp1 - t).abs().reshape(-1)[0].clamp(min=1e-6) / self.time_scale_factor
+            u0 = (torch.exp(ut) if self.log_transform else ut).reshape(-1)
+            u1 = (torch.exp(utp1) if self.log_transform else utp1).reshape(-1)
+            g_t = self.g(s, t).reshape(-1)
+            g_tp1 = self.g(s, tp1).reshape(-1)
+            # population-weighted mean E_p[g]: cells are sampled UNIFORMLY, so weight by the
+            # observed density u to recover the density-weighted mean the identity requires.
+            Eg_t = (g_t * u0).sum() / u0.sum().clamp(min=1e-12)
+            Eg_tp1 = (g_tp1 * u1).sum() / u1.sum().clamp(min=1e-12)
+            lnN_pred = 0.5 * (Eg_t + Eg_tp1) * dt_g
+            if self.growth_pop_ref == 'popmean' and train_batch.get('relmass', None) is not None:
+                lnN_true = torch.log(train_batch['relmass'].reshape(-1)[0].clamp(min=1e-9))
+            else:
+                lnN_true = torch.log(u1.sum().clamp(min=1e-9)) - torch.log(u0.sum().clamp(min=1e-9))
+            growth_loss = (lnN_pred - lnN_true) ** 2
+        elif self.growth_loss_mode == 'massbalance':
+            # N_{t+1} = N_t + ∫∫ g·u dt, integrated with the POP-SCALED neural-ODE density
+            # (u at t0 = ut data, u at t1 = u_int[-1] integrated) so the two sides share units;
+            # compared in log space. drift/diffusion stay on u_net and vanish in the global sum.
+            # g_net = time_scale_factor * g_real -> divide the interval by time_scale_factor.
+            dt_g = (tp1 - t).abs().reshape(-1)[0].clamp(min=1e-6) / self.time_scale_factor
+            u0 = (torch.exp(ut) if self.log_transform else ut).reshape(-1)
+            u1 = (torch.exp(utp1) if self.log_transform else utp1).reshape(-1)
+            u1_int = u_int[-1].reshape(-1)
+            g_t = self.g(s, t).reshape(-1)
+            g_tp1 = self.g(s, tp1).reshape(-1)
+            integ_growth = 0.5 * (g_t * u0 + g_tp1 * u1_int) * dt_g
+            pred_Ntp1 = u0.sum() + integ_growth.sum()
+            if self.growth_pop_ref == 'popmean' and train_batch.get('relmass', None) is not None:
+                true_Ntp1 = u0.sum() * train_batch['relmass'].reshape(-1)[0]
+            else:
+                true_Ntp1 = u1.sum()
+            growth_loss = (torch.log(pred_Ntp1.clamp(min=1e-9)) - torch.log(true_Ntp1.clamp(min=1e-9))) ** 2
         elif self.log_transform:
             left = torch.exp(utp1).sum()
             right = torch.exp(ut + growth[-1]).sum()
@@ -988,103 +1036,6 @@ class pde_params(pde_params_base):
         loss = self.training_step(val_batch, index)
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         
-    def stratified_ode(self, t, states):
-        """
-        the function used for odeint
-        """
-        s = states[1]
-        device = s.device
-        t_in = torch.full((s.shape[0],1), t.item()*5).float().to(device)
-
-        with torch.set_grad_enabled(True):
-
-            s.requires_grad_(True)
-            t_in.requires_grad_(True)
-
-            u = torch.exp(self.u(s, t_in)) # make sure it is u but not log u
-
-            _, growth, drift, diffuse = self.equation(s, t_in)
-
-            dudt = growth - drift + diffuse
-
-            # set ds to zeros to fix cellstates
-            ds = torch.zeros_like(s).float().to(device).requires_grad_(True)
-
-        return (dudt, ds, growth, drift, diffuse)
-
-    def statify_flow(self, train_DS, batch_size=1024, window_size=1):
-        r"""
-        stratify the constribution of cells
-
-        Arguments:
-        -----------
-        train_DS: highdim_DS class
-        batch_size : batch_size for looping the adataset
-        window_size: the time window for integral, 1 for next timepoint
-
-        Returns
-        -----------
-        dilution_flow : density gain from growth
-        dirft_flow : density gain from differetiation
-        diffuse_flow : density gain from random diffusion
-        """
-        # get device from module
-        device = next(self.u.parameters()).device
-
-        n_timepoint = train_DS.n_timepoint
-        t_list = train_DS.T_b / self.time_scale_factor
-        u_b = train_DS.u_b.reshape(n_timepoint, -1)
-        cellstate = torch.from_numpy(train_DS.cellstate).float().requires_grad_()
-
-    
-        dilution_flow = []
-        dirft_flow = []
-        diffuse_flow = []
-        
-        for it in range(n_timepoint-window_size):
-            
-            t_i = t_list[it]
-            t_ip1 = t_list[it + window_size]
-
-            g_flow_ls = []
-            v_flow_ls = []
-            d_flow_ls = []
-
-            for i in range(0, cellstate.shape[0], batch_size):
-
-                u_t0 = u_b[it, i:i+batch_size].to(device)
-                s = cellstate[i:i+batch_size].to(device)
-                
-                # (dudt, ds, growth, -1 * drift, diffuse)
-                init_condition = (u_t0, s, 
-                                  torch.zeros_like(u_t0).to(device), 
-                                  torch.zeros_like(u_t0).to(device), 
-                                  torch.zeros_like(u_t0).to(device))
-                
-                u_int, s_t, g_flow, v_flow, d_flow = odeint(
-                                self.stratified_ode,
-                                y0 = init_condition,
-                                t = torch.tensor([t_i, t_ip1]).type(torch.float32).to(device),
-                                atol = self.ode_tol,
-                                rtol = self.ode_tol,
-                                method='dopri5',
-                            )
-
-                # append for different batches
-                g_flow_ls.append( g_flow[1].detach().cpu().numpy() )
-                v_flow_ls.append( v_flow[1].detach().cpu().numpy() )
-                d_flow_ls.append( d_flow[1].detach().cpu().numpy() )
-
-                # torch.cuda.empty_cache()
-            
-            # append for different timepoints
-            dilution_flow.append( np.concatenate(g_flow_ls, axis=0) )
-            dirft_flow.append( np.concatenate(v_flow_ls, axis=0) )
-            diffuse_flow.append( np.concatenate(d_flow_ls, axis=0) )
-        
-        
-        return np.stack(dilution_flow), np.stack(dirft_flow), np.stack(diffuse_flow)
-
 class pde_params_fastmode(pde_params):
     def __init__(self, channels, growth_weight=None, collapse_D = True, collapse_v = False, g_channels=None, v_channels=None, D_channels=None, time_sensitive=True, lr=3e-4, ode_tol=1e-4, activation_fn:Union[str, list] = 'Tanh', deltax_weight = None, D_penalty = None, weight_intensity=None, time_scale_factor=None, pop_weight=None):
         r"""
@@ -1191,7 +1142,7 @@ class log_pde_params(pde_params):
 
 
         """
-        super().__init__(channels=channels, collapse_D = collapse_D, collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, time_sensitive=True, lr=lr, ode_tol=ode_tol, activation_fn=activation_fn, D_penalty = D_penalty, weight_intensity=weight_intensity, deltax_weight=deltax_weight, time_scale_factor=time_scale_factor, pop_weight=pop_weight)
+        super().__init__(channels=channels, collapse_D = collapse_D, collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, time_sensitive=True, lr=lr, ode_tol=ode_tol, activation_fn=activation_fn, D_penalty = D_penalty, weight_intensity=weight_intensity, deltax_weight=deltax_weight, time_scale_factor=time_scale_factor, pop_weight=pop_weight, growth_loss_mode='legacy')
         self.save_hyperparameters()
         self.log_transform = True
 

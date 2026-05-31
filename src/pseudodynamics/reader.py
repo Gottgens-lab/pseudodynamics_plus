@@ -416,6 +416,10 @@ class TwoTimpepoint_AnnDS(HigDim_AnnDS):
             batch['cfm_x0'] = torch.from_numpy(self.cellstate[x0_idx]).float()
             batch['cfm_x1'] = torch.from_numpy(self.cellstate[x1_idx]).float()
 
+        # True population ratio N_{t+1}/N_t for the 'popmean' growth reference (open-system anchor)
+        batch['relmass'] = torch.tensor(
+            float(self.pop_mean[i_tp1]) / float(self.pop_mean[i_t]), dtype=torch.float32)
+
         return batch
 
 class TwoTimpepoint_AnnDS_fastmode(TwoTimpepoint_AnnDS):
