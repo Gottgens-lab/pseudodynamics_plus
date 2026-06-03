@@ -404,7 +404,7 @@ class TwoTimpepoint_AnnDS(HigDim_AnnDS):
         u_t = self.u_b[i_t, s_index]
         u_tp1 = self.u_b[i_tp1, s_index]  # density of the t plus 1
 
-        batch = {'s':s, 't':t, 'tp1':t_p1, 'ut':u_t, 'utp1':u_tp1, 'deltax':deltax}
+        batch = {'s':s, 't':t, 'tp1':t_p1, 'ut':u_t, 'utp1':u_tp1, 'deltax':deltax, 'i_t': i_t}
 
         # CFM pairing: sample cells from consecutive timepoints
         if hasattr(self, 'cells_per_tp'):

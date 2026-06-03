@@ -223,6 +223,9 @@ class pde_params_base(pl.LightningModule):
         D = self.D(s,t)
         if exp:
             D = torch.exp(D)
+        if getattr(self, 'd_penalty_mode', 'legacy') == 'mean':
+            # Mean of squared D over all elements — genuinely batch-size invariant
+            return D.pow(2).mean()
         D_L2 = torch.norm(D, p=2).sum()  # in case D is high dimensional
         return D_L2
 
@@ -622,7 +625,14 @@ class pde_params(pde_params_base):
                     g_init_rate=None,
                     growth_loss_mode='logratio',
                     growth_pop_ref='cellsum',
-                    residual_mode='raw'
+                    residual_mode='raw',
+                    ema_decay=None,
+                    rcg_warmup_steps=None,
+                    rcg_clip_pct=None,
+                    rcg_u_net_raw_weight=None,
+                    n_timepoints=11,
+                    cfm_loops=10,
+                    d_penalty_mode='legacy',
                 ):
 
         super().__init__(channels=channels,collapse_D = collapse_D,collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, 
@@ -658,8 +668,19 @@ class pde_params(pde_params_base):
         # g = rhs/u continuity inversion), scale-free, instead of the raw u**2-scaled
         # MSE. Default 'raw' preserves original behaviour.
         self.residual_mode = (residual_mode or 'raw')
-        assert self.residual_mode in ('raw', 'ginv'), \
-            f"residual_mode must be raw|ginv, got {self.residual_mode!r}"
+        assert self.residual_mode in ('raw', 'ginv', 'rcg'), \
+            f"residual_mode must be raw|ginv|rcg, got {self.residual_mode!r}"
+
+        # RCG (Residual-Centered Growth) parameters
+        self.ema_decay           = 0.95 if ema_decay is None else float(ema_decay)
+        self.rcg_warmup_steps    = 300  if rcg_warmup_steps is None else int(rcg_warmup_steps)
+        self.rcg_clip_pct        = 0.02 if rcg_clip_pct is None else float(rcg_clip_pct)
+        self.rcg_u_net_raw_weight = 0.05 if rcg_u_net_raw_weight is None else float(rcg_u_net_raw_weight)
+        self.n_timepoints        = int(n_timepoints)
+        self.cfm_loops           = int(cfm_loops)
+        self.d_penalty_mode      = str(d_penalty_mode)
+        assert self.d_penalty_mode in ('legacy', 'mean'), \
+            f"d_penalty_mode must be legacy|mean, got {self.d_penalty_mode!r}"
         # Opt-in: hard-clamp the diffusion field into (lo, hi) wherever D enters
         # the PDE dynamics (GRN-3D experiment). Default None preserves original
         # behaviour. Accepts "lo,hi" (CLI/config string) or a (lo, hi) sequence.
@@ -676,7 +697,15 @@ class pde_params(pde_params_base):
         # Opt-in: use UNBALANCED OT (marginal relaxation reg_m) for the CFM velocity-loss
         # pairing instead of balanced OT. None (default) -> balanced (original behaviour).
         self.cfm_unbalanced_reg_m = None if cfm_unbalanced_reg_m is None else float(cfm_unbalanced_reg_m)
-       
+
+        # EMA buffers for RCG: per-timepoint smoothed density-weighted residual mean.
+        # Stored in state_dict (survives checkpoint) but NOT in optimizer.
+        # Initialized lazily (NaN) to avoid cold-start bias; first-batch value used directly.
+        self.register_buffer('_Eg_resid_ema',
+            torch.full((self.n_timepoints,), float('nan')))
+        self.register_buffer('_ema_initialized',
+            torch.zeros(self.n_timepoints, dtype=torch.bool))
+
         MLP_Module = MLP_surrogate
         # u_theta, density function
         self.u = MLP_surrogate(channels = channels, activation_fn=activation_fn, time_sensitive=True)
@@ -894,6 +923,74 @@ class pde_params(pde_params_base):
         return self.loss_fn(rhs.squeeze(), dudt.squeeze())
         # return self.loss_fn(torch.log(rhs.squeeze()+1e-10), torch.log(dudt.squeeze()+1e-10))
 
+    def residual_loss_raw(self, s, t):
+        """Raw FP residual (u^2-weighted MSE). Provides a gradient path into u_net in RCG mode."""
+        saved = self.residual_mode
+        self.residual_mode = 'raw'
+        loss = self.residual_loss(s, t)
+        self.residual_mode = saved
+        return loss
+
+    def rcg_loss(self, s, t, tp1, ut, relmass, i_t):
+        """
+        Residual-Centered Growth (RCG) loss.
+
+        Spatial signal: ginv target r_i approximates per-cell g at FP solution.
+        Mean correction: subtract EMA-smoothed density-weighted batch mean Eg_resid,
+                         which tracks the drifting intercept from u_net's temporal error.
+        Magnitude anchor: add exact Eg_true = log(relmass)/dt_g (zero sampling variance).
+
+        Only g_net receives gradient. All target computation is detached.
+        """
+        assert not self.log_transform, \
+            "rcg_loss requires a linear-density model (log_transform=False)"
+
+        with torch.set_grad_enabled(True):
+            s = s.detach().requires_grad_(True)
+            t = t.detach().requires_grad_(True)
+            dudt, growth, drift, diffuse = self.equation(s, t)
+            u = self.get_u(s, t).reshape(-1)
+            u_safe = u.clamp(min=(u.mean() * 1e-2).clamp(min=1e-9))
+            r_raw = ((dudt + drift - diffuse).reshape(-1) / u_safe).detach()
+
+        r_raw = torch.nan_to_num(r_raw, nan=0.0)  # guard quantile against upstream NaN
+
+        # Percentile clip: suppress 1/u_safe blow-up at low-density cells
+        if self.rcg_clip_pct > 0:
+            lo = torch.quantile(r_raw, self.rcg_clip_pct)
+            hi = torch.quantile(r_raw, 1.0 - self.rcg_clip_pct)
+            r_clip = r_raw.clamp(min=lo, max=hi)
+        else:
+            r_clip = r_raw
+
+        # SNIS ratio estimator for density-weighted mean of the residual
+        u0 = ut.reshape(-1).detach()
+        Eg_resid_batch = (r_clip * u0).sum() / u0.sum().clamp(min=1e-12)
+
+        # EMA update per timepoint; buffer lives in state_dict, not in optimizer
+        with torch.no_grad():
+            i_t_int = int(i_t)
+            if not self._ema_initialized[i_t_int]:
+                self._Eg_resid_ema[i_t_int] = Eg_resid_batch.item()
+                self._ema_initialized[i_t_int] = True
+            else:
+                self._Eg_resid_ema[i_t_int] = (
+                    self.ema_decay * self._Eg_resid_ema[i_t_int]
+                    + (1.0 - self.ema_decay) * Eg_resid_batch.item()
+                )
+        Eg_resid_smooth = self._Eg_resid_ema[i_t_int].item()
+
+        # Exact magnitude anchor from observed population ratio; zero sampling variance
+        dt_g = (tp1 - t).abs().reshape(-1)[0].clamp(min=1e-6, max=10.0) / self.time_scale_factor
+        Eg_true = torch.log(relmass.reshape(-1)[0].clamp(min=1e-9)) / dt_g
+
+        # Per-cell corrected target: fully detached, no gradient anywhere in the target
+        g_target_rcg = (r_clip - Eg_resid_smooth + Eg_true.item()).detach()
+
+        # MSE: gradient flows only through g_pred (g_net parameters)
+        g_pred = self.g(s.detach(), t.detach()).reshape(-1)
+        return torch.mean((g_pred - g_target_rcg) ** 2), Eg_true.item(), Eg_resid_smooth
+
 
     def training_step(self, train_batch, index):
         
@@ -928,9 +1025,30 @@ class pde_params(pde_params_base):
         D_norm = self.restrict_D(s, t, exp=False)    # constrain D
         v_loss = self.constrain_v(s,t,deltax)        # constrain v by local velocity
 
-        # duds_loss = -1 * nn.functional.cosine_similarity(duds[-1], duds_tp1)
-        # constrain g by population size
-        if self.growth_loss_mode == 'logratio':
+        # RCG: replace R_loss with mean-corrected ginv target + relmass magnitude anchor
+        _rcg_Eg_true = 0.0
+        _rcg_Eg_smooth = 0.0
+        raw_R_for_u = torch.tensor(0.0, device=s.device)
+        if self.residual_mode == 'rcg':
+            i_t = int(train_batch.get('i_t', 0))
+            r_eff = self.R_weight * min(1.0, self.global_step / max(1, self.rcg_warmup_steps)) \
+                    if self.rcg_warmup_steps > 0 else float(self.R_weight)
+            if self.global_step >= self.rcg_warmup_steps:
+                R_loss, _rcg_Eg_true, _rcg_Eg_smooth = self.rcg_loss(
+                    s, t, tp1, ut, train_batch['relmass'], i_t)
+                # Raw FP residual: intentionally trains BOTH u_net and g_net toward FP
+                # consistency (the spec's u_net+g_net anchor). Do NOT detach g here.
+                raw_R_for_u = self.residual_loss_raw(s, t)
+            growth_weight_eff = 0.0
+            growth_loss = torch.tensor(0.0, device=s.device)
+        else:
+            r_eff = float(self.R_weight)
+            growth_weight_eff = self.growth_weight
+
+        # constrain g by population size (skipped in RCG mode)
+        if self.residual_mode == 'rcg':
+            pass  # growth_loss already zeroed above
+        elif self.growth_loss_mode == 'logratio':
             # d ln N/dt = E_p[g]  =>  log(N_{t+1}/N_t) = ∫ E[g] dτ  (trapezoid over the
             # interval). Scale-free: depends only on g averaged over the batch cells, not on
             # the absolute scale of the free density net, so g can no longer hide behind a
@@ -993,7 +1111,7 @@ class pde_params(pde_params_base):
         # loss 4 (optional): Conditional Flow Matching velocity loss
         cfm_loss = torch.tensor(0.0, device=s.device)
         if self.cfm_weight > 0 and 'cfm_x0' in train_batch:
-            for i in range(10):
+            for _ in range(self.cfm_loops):
                 cfm_loss += self.cfm_velocity_loss(
                     train_batch['cfm_x0'], train_batch['cfm_x1'], t, tp1,
                 )
@@ -1010,10 +1128,11 @@ class pde_params(pde_params_base):
                     self.neuralode_weight * log_sim_loss_tp1 + \
                     self.D_penalty * D_norm + \
                     self.deltax_weight * v_loss + \
-                    self.growth_weight * growth_loss + \
+                    growth_weight_eff * growth_loss + \
                     self.cfm_weight * cfm_loss + \
                     self.D_var_weight * D_var_loss + \
-                    self.R_weight * R_loss
+                    r_eff * R_loss + \
+                    self.rcg_u_net_raw_weight * raw_R_for_u
 
 
         with torch.no_grad():
@@ -1028,6 +1147,15 @@ class pde_params(pde_params_base):
             self.log("residual loss", R_loss.item(), on_epoch=True)
             self.log("integrat_loss", log_sim_loss_tp1.item(), on_epoch=True)
             self.log("total_loss", total_loss, on_epoch=True, prog_bar=True)
+            if self.residual_mode == 'rcg':
+                self.log("rcg_Eg_true",   float(_rcg_Eg_true),   on_epoch=True)
+                self.log("rcg_Eg_smooth", float(_rcg_Eg_smooth), on_epoch=True)
+                self.log("rcg_r_eff",     float(r_eff),          on_epoch=True)
+                self.log("rcg_magnitude_correction",
+                         float(_rcg_Eg_true) - float(_rcg_Eg_smooth), on_epoch=True)
+                with torch.set_grad_enabled(False):
+                    g_pred_mean = self.g(s.detach(), t.detach()).mean()
+                self.log("g_pred_mean", g_pred_mean.item(), on_epoch=True)
 
         return total_loss
 
