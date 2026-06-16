@@ -110,6 +110,30 @@ git checkout diffusion_improvement
 ```
 
 
+## Updates
+
+Reverse-chronological log of the latest functionality on `diffusion_improvement`.
+
+### 2026-06-16 — `main_train_rcg.py`: clean RCG training entry point
+
+A dedicated training script for the **RCG (Residual-Centered Growth)** PINN, kept separate from
+`main_train.py` so RCG runs launch without the original script's config-override foot-guns:
+
+- `--config` is **merged** with CLI args — unspecified CLI flags no longer clobber config values.
+- Exposes every RCG flag and ships defaults that match the recommended launch config
+  (`--residual_mode` defaults to `rcg`, `--growth_loss_mode` to `logratio`).
+- Runs the CFM loop once (`cfm_loops=1`) and uses the batch-size-invariant diffusion penalty
+  (`d_penalty_mode='mean'`, i.e. `D.pow(2).mean()`).
+- `--gpu_devices` defaults to `"0"`.
+
+```bash
+python main_train_rcg.py --dataset <h5ad_stem> --config logs/<exp>/V0_config.json
+```
+
+The RCG residual mode itself (`residual_mode='rcg'` — mean-corrected `ginv` target plus a
+`relmass` magnitude anchor) is documented in the *Constructor-only knobs* table above.
+
+
 ## Reproducible configs and checkpoints
 
 The `logs/` directory contains the exact configs and trained checkpoints for every experiment in the manuscript and rebuttals (Klein, Tom, cord blood, synthetic Fokker–Planck, ablations, etc.). Each experiment directory follows the same layout:
