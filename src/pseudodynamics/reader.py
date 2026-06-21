@@ -41,7 +41,7 @@ class HigDim_AnnDS(AnnDataset):
         the space to evaluate the density
 
     """
-    def __init__(self, AnnData, cellstate_key='cellstate', timepoint_key='timepoint_tx_days', timepoint_idx=None, n_dimension=5, knn_volume= False, nearby_cellstate=1, norm_time=False, deltax_key=None, density_funs=None, kde_kws={}, base_cellstate=None,  pop_dict=None, n_grid=300, collocation_points=600,  log_transform=False ,resampling_indensity=0.5, resampling_rate=0.5):
+    def __init__(self, AnnData, cellstate_key='cellstate', timepoint_key='timepoint_tx_days', timepoint_idx=None, n_dimension=5, knn_volume= False, nearby_cellstate=1, norm_time=False, deltax_key=None, density_funs=None, kde_kws={}, base_cellstate=None,  pop_dict=None, n_grid=300, collocation_points=600,  log_transform=False ,resampling_indensity=0.5, resampling_rate=0.5, equal_mass=False):
         
         super().__init__(AnnData, cellstate_key=cellstate_key, timepoint_key=timepoint_key, pop_dict=pop_dict, n_grid=n_grid, collocation_points=collocation_points,  log_transform=log_transform, norm_time=norm_time, resampling_indensity=resampling_indensity, resampling_rate=resampling_rate)
         
@@ -50,6 +50,7 @@ class HigDim_AnnDS(AnnDataset):
         self.nearby_cellstate = nearby_cellstate
         self.deltax_key = deltax_key
         self.kde_kws = kde_kws
+        self.equal_mass = bool(equal_mass)   # R2.3 ablation: equal total mass per timepoint
 
         
         if isinstance(timepoint_idx, list):
@@ -211,21 +212,24 @@ class HigDim_AnnDS(AnnDataset):
             n_exp = self.popD['n_lib'][tb_idx]
 
             # u_min = np.min(u[u!=0])
+            # ABLATION (R2.3 --equal_mass): rescale every timepoint to the SAME total mass
+            # (the t0 reference) so the population-size signal is removed from training.
+            _mref = self.popD['mean'][0] if getattr(self, 'equal_mass', False) else self.popD['mean'][tb_idx]
             if self.log_transform:
                 threshold = np.quantile(u, q=[1e-3,1-1e-3])
                 u = np.clip(u, *threshold) + np.log(self.volume)
                 u_sum = np.exp(u).sum()
-                scaler = np.log(self.popD['mean'][tb_idx] / u_sum)
+                scaler = np.log(_mref / u_sum)
                 u = u - np.log(u_sum)
-                ub_ls.append(u + np.log(self.popD['mean'][tb_idx]))
+                ub_ls.append(u + np.log(_mref))
             else:
                 u *= self.volume
                 u_sum = u.sum()
                 u = np.where(u!=0, u, 1e-10) # replace 0 with 0.1* u_min
-                scaler = self.popD['mean'][tb_idx] / u_sum
+                scaler = _mref / u_sum
                 u = u / u.sum()
-                # u = np.clip(u, a_min=1e-10, a_max=None) 
-                ub_ls.append(u*self.popD['mean'][tb_idx])        
+                # u = np.clip(u, a_min=1e-10, a_max=None)
+                ub_ls.append(u*_mref)
             
             u_scale.append(scaler)
 
@@ -309,9 +313,9 @@ class TwoTimpepoint_AnnDS(HigDim_AnnDS):
                             **config.dataset_config
                             )
     """
-    def __init__(self, AnnData, split='train', cellstate_key='cellstate', timepoint_key='timepoint_tx_days', timepoint_idx=None, n_dimension=5, knn_volume= False,  batchsize=200,  norm_time=False, deltax_key=None, density_funs=None, kde_kws={}, nearby_cellstate=1, base_cellstate=None,  pop_dict=None, n_grid=300, collocation_points=600,  log_transform=False ,resampling_indensity=0.5, resampling_rate=0.5):
-        
-        super().__init__(AnnData, cellstate_key=cellstate_key, timepoint_key=timepoint_key, timepoint_idx=timepoint_idx, knn_volume=knn_volume, n_dimension=n_dimension, nearby_cellstate=nearby_cellstate, norm_time=norm_time, deltax_key=deltax_key, density_funs=density_funs, kde_kws=kde_kws, base_cellstate=base_cellstate,  pop_dict=pop_dict, n_grid=n_grid, collocation_points=collocation_points,  log_transform=log_transform ,resampling_indensity=resampling_indensity, resampling_rate=resampling_rate)
+    def __init__(self, AnnData, split='train', cellstate_key='cellstate', timepoint_key='timepoint_tx_days', timepoint_idx=None, n_dimension=5, knn_volume= False,  batchsize=200,  norm_time=False, deltax_key=None, density_funs=None, kde_kws={}, nearby_cellstate=1, base_cellstate=None,  pop_dict=None, n_grid=300, collocation_points=600,  log_transform=False ,resampling_indensity=0.5, resampling_rate=0.5, equal_mass=False):
+
+        super().__init__(AnnData, cellstate_key=cellstate_key, timepoint_key=timepoint_key, timepoint_idx=timepoint_idx, knn_volume=knn_volume, n_dimension=n_dimension, nearby_cellstate=nearby_cellstate, norm_time=norm_time, deltax_key=deltax_key, density_funs=density_funs, kde_kws=kde_kws, base_cellstate=base_cellstate,  pop_dict=pop_dict, n_grid=n_grid, collocation_points=collocation_points,  log_transform=log_transform ,resampling_indensity=resampling_indensity, resampling_rate=resampling_rate, equal_mass=equal_mass)
         self.batchsize = batchsize
         self.u_b = self.u_b.reshape(self.n_timepoint, -1)
 
@@ -404,7 +408,7 @@ class TwoTimpepoint_AnnDS(HigDim_AnnDS):
         u_t = self.u_b[i_t, s_index]
         u_tp1 = self.u_b[i_tp1, s_index]  # density of the t plus 1
 
-        batch = {'s':s, 't':t, 'tp1':t_p1, 'ut':u_t, 'utp1':u_tp1, 'deltax':deltax}
+        batch = {'s':s, 't':t, 'tp1':t_p1, 'ut':u_t, 'utp1':u_tp1, 'deltax':deltax, 'i_t': i_t}
 
         # CFM pairing: sample cells from consecutive timepoints
         if hasattr(self, 'cells_per_tp'):
@@ -415,6 +419,10 @@ class TwoTimpepoint_AnnDS(HigDim_AnnDS):
             x1_idx = np.random.choice(idx_tp1, size=n_cfm, replace=len(idx_tp1) < n_cfm)
             batch['cfm_x0'] = torch.from_numpy(self.cellstate[x0_idx]).float()
             batch['cfm_x1'] = torch.from_numpy(self.cellstate[x1_idx]).float()
+
+        # True population ratio N_{t+1}/N_t for the 'popmean' growth reference (open-system anchor)
+        batch['relmass'] = torch.tensor(
+            float(self.pop_mean[i_tp1]) / float(self.pop_mean[i_t]), dtype=torch.float32)
 
         return batch
 
