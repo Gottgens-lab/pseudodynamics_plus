@@ -74,6 +74,8 @@ optional_args.add_argument("--seed", type=int, required=False, default=None, hel
 optional_args.add_argument("--max_epochs", type=int, required=False, default=400, help='maximum training epochs (default 400)')
 optional_args.add_argument("--progress_bar", type=str, required=False, default="True", help='whether show progress bar on screen, boolen value, default True')
 optional_args.add_argument("--resume_ckpt", type=str, required=False, default=None, help='path to checkpoint to resume training from')
+optional_args.add_argument("--zero_growth", action="store_true", required=False, help='ABLATION (R2.3): force the growth field g(s,t) == 0 everywhere (parameterless zero stub); drift and diffusion unchanged. Survives --config. Opt-in, default off.')
+optional_args.add_argument("--equal_mass", action="store_true", required=False, help='ABLATION (R2.3): rescale every timepoint density to the SAME total mass (popD["mean"][0]) so the population-size signal is removed from training. Survives --config. Opt-in, default off.')
 
 args = parser.parse_args()
 
@@ -86,6 +88,9 @@ if args.config:
     log_name_cli = args.log_name
     progress_bar_cli = args.progress_bar
     max_epochs_cli = args.max_epochs
+    resume_ckpt_cli = args.resume_ckpt
+    zero_growth_cli = args.zero_growth
+    equal_mass_cli = args.equal_mass
     args = Namespace(**config.raw_args)
     args.gpu_devices = gpu_devices    # otherwise covered by the configged gpu devices
     if seed_cli is not None:
@@ -94,6 +99,10 @@ if args.config:
         args.log_name = log_name_cli
     args.progress_bar = progress_bar_cli
     args.max_epochs = max_epochs_cli
+    args.resume_ckpt = resume_ckpt_cli
+    # ablation flags (R2.3): CLI wins; fall back to a value carried in the config
+    args.zero_growth = bool(zero_growth_cli or getattr(args, 'zero_growth', False))
+    args.equal_mass = bool(equal_mass_cli or getattr(args, 'equal_mass', False))
     # config.raw_args['config'] = args.config   # Preserve original config path
 else:
     # Validate required arguments
@@ -147,6 +156,7 @@ if args.model == "pde_params":
     model_kws = dict(v_channels = [n_dim] + hidden_channels + [args.n_dimension],
                     g_channels = [n_dim] + hidden_channels + [1],
                     D_channels = [n_dim] + hidden_channels + [1],#[args.n_dimension]
+                    zero_growth = getattr(args, 'zero_growth', False),
                     )
     channels = [args.n_dimension + 1 ] + hidden_channels + [1]
 else:
@@ -203,7 +213,8 @@ ds_kws = dict(  timepoint_idx = args.timepoint_idx,
                 norm_time=args.norm_time,
                 deltax_key=args.deltax_key,
                 kde_kws = {"bw_method":args.bw},
-                batchsize=args.batch_size
+                batchsize=args.batch_size,
+                equal_mass = getattr(args, 'equal_mass', False),
             )
 
 # Optional GMM density (opt-in via --density_estimator=gmm; default kde is unchanged)

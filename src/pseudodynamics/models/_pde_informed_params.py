@@ -557,6 +557,25 @@ class pde_params_base(pl.LightningModule):
             
             return (ds, growth_local-drift, ds, du)
 
+class _ZeroField(nn.Module):
+    r"""R2.3 ablation stub: a parameterless growth field that returns g(s,t) == 0.
+
+    Drop-in replacement for the growth MLP (``self.g``). Matches ``MLP_surrogate``'s
+    output shape ``(B,)`` (it squeezes the trailing dim) so every g(s,t) call site
+    (PDE source term, ODE/SDE forward, growth loss, predict_param) sees zeros with no
+    other change; drift and diffusion are untouched. Has no parameters, so it adds
+    nothing to the optimiser and an empty state_dict (load_from_checkpoint round-trips).
+    """
+    def __init__(self, time_sensitive=True):
+        super().__init__()
+        self.time_sensitive = time_sensitive
+
+    def forward(self, s, t=None):
+        if not isinstance(s, torch.Tensor):
+            s = torch.as_tensor(s)
+        return torch.zeros(s.shape[0], device=s.device, dtype=s.dtype)
+
+
 class pde_params(pde_params_base):
     r"""
     Default model : PINN prediction + NeuralODE simulation to estimate parameters
@@ -633,6 +652,7 @@ class pde_params(pde_params_base):
                     n_timepoints=11,
                     cfm_loops=10,
                     d_penalty_mode='legacy',
+                    zero_growth=False,
                 ):
 
         super().__init__(channels=channels,collapse_D = collapse_D,collapse_v = collapse_v, g_channels=g_channels, v_channels=v_channels, D_channels=D_channels, 
@@ -714,13 +734,20 @@ class pde_params(pde_params_base):
         if g_channels  is None:
             g_channels = channels[:-1] + [1]
         self.g = MLP_Module(channels = g_channels, activation_fn=activation_fn, time_sensitive=time_sensitive)
+        # ABLATION (R2.3): force the growth field g(s,t) == 0 everywhere by swapping the
+        # g-net for a parameterless zero stub. Every g(s,t) call site then returns 0 with
+        # no further change; drift and diffusion are untouched. Captured by
+        # save_hyperparameters() above so load_from_checkpoint restores the stub.
+        self.zero_growth = bool(zero_growth)
+        if self.zero_growth:
+            self.g = _ZeroField(time_sensitive=time_sensitive)
         # Opt-in: warm-start the growth net to a population-derived mean rate so g does not
         # collapse toward 0. Sets the output-layer bias to g_init_rate and shrinks its weights,
         # so g(x,t) ~= g_init_rate at init; the (per-cell) growth loss then shapes the
         # spatial/temporal structure. Mirrors DeepRUOT's Phase-1 growth pretrain. Default None
         # = standard init (original behaviour).
         self.g_init_rate = None if g_init_rate is None else float(g_init_rate)
-        if self.g_init_rate is not None:
+        if self.g_init_rate is not None and not self.zero_growth:
             with torch.no_grad():
                 last_lin = [m for m in self.g.u_theta if isinstance(m, nn.Linear)][-1]
                 last_lin.weight.mul_(0.01)
@@ -1048,6 +1075,11 @@ class pde_params(pde_params_base):
         # constrain g by population size (skipped in RCG mode)
         if self.residual_mode == 'rcg':
             pass  # growth_loss already zeroed above
+        elif growth_weight_eff == 0:
+            # No population-size constraint (R2.3 --equal_mass C-arms, or any growth_weight=0
+            # run): skip the growth loss. It is multiplied by 0 anyway, and the legacy form
+            # divides by mass_gain, which -> 0 under equal-mass targets (NaN). Keep it at 0.
+            growth_loss = torch.tensor(0.0, device=s.device)
         elif self.growth_loss_mode == 'logratio':
             # d ln N/dt = E_p[g]  =>  log(N_{t+1}/N_t) = ∫ E[g] dτ  (trapezoid over the
             # interval). Scale-free: depends only on g averaged over the batch cells, not on
