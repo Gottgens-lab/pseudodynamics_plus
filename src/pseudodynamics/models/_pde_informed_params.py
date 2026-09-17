@@ -461,6 +461,20 @@ class pde_params_base(pl.LightningModule):
 
         return v_pred_ay
 
+    def on_load_checkpoint(self, checkpoint):
+        """
+        Backward compatibility for checkpoints trained before the RCG feature.
+
+        The EMA buffers ``_Eg_resid_ema`` and ``_ema_initialized`` are registered
+        unconditionally, so a checkpoint saved before they existed lacks them and
+        ``load_from_checkpoint`` fails with strict loading. Lightning calls this hook
+        before ``load_state_dict``, so we insert the freshly initialised buffers here.
+        """
+        state_dict = checkpoint.get("state_dict", {})
+        for name in ("_Eg_resid_ema", "_ema_initialized"):
+            if name not in state_dict and hasattr(self, name):
+                state_dict[name] = getattr(self, name).detach().clone()
+
     def predict_param(self, train_DS, device=None):    
         r"""
         Given a DataSet Class, predict the param 

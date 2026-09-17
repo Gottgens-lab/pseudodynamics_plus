@@ -18,3 +18,4 @@ Functions:
 
 from ._base import *
 from ._association_test import *
+from ._utils import *

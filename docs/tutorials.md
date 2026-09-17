@@ -26,6 +26,15 @@ notebooks/evaluate_parameters
 ```
 
 
+## drift association test
+```{toctree}
+:maxdepth: 1
+:titlesonly:
+
+notebooks/drift_association_test
+```
+
+
 ## continuous density transport
 ```{toctree}
 :maxdepth: 1

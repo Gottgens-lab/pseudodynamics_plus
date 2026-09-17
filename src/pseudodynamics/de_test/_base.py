@@ -22,6 +22,31 @@ logger = logging.getLogger(__name__)
 
 
 
+class _SmootherHolder:
+    """Minimal stand-in for ``result.model`` so that ``result.model.smoother`` keeps working."""
+    def __init__(self, smoother):
+        self.smoother = smoother
+
+
+class SlimGAMResult:
+    """
+    Lightweight replacement for a statsmodels ``GLMGamResults`` object.
+
+    A full statsmodels result keeps the data, the spline basis and the residuals of
+    every gene (about 1 MB per gene), which exhausts memory for tens of thousands of
+    genes. The association tests only need the coefficients, their covariance and the
+    smoother, so only those are kept. The smoother is shared by all genes fitted on the
+    same pseudotime.
+    """
+    def __init__(self, res, smoother):
+        self.params = np.asarray(res.params, dtype=float)
+        self._cov_params = np.asarray(res.cov_params(), dtype=float)
+        self.model = _SmootherHolder(smoother)
+
+    def cov_params(self):
+        return self._cov_params
+
+
 def fitGAM(count_matrix, cell_time, n_knots=7, cell_weights=None, gene_symbol=None):
     r"""
     Fits a GAM model per gene using pseudotime.
@@ -45,76 +70,58 @@ def fitGAM(count_matrix, cell_time, n_knots=7, cell_weights=None, gene_symbol=No
     if cell_weights is None:
         cell_weights = np.ones(len(cell_time))
 
+    cell_time = np.asarray(cell_time, dtype=float)
     models = {}
-    design_matrix = np.linspace(0, 1, len(np.unique(cell_time)))
-    design_matrix = np.repeat(design_matrix[np.newaxis, :], count_matrix.shape[1], axis=0)  # shape (genes, timepoints)
+    design = np.linspace(0, 1, len(np.unique(cell_time)))   # identical for every gene
+
+    # sorted pseudotime, shared by every pred_func (interp1d copies nothing then)
+    order = np.argsort(cell_time)
+    t_sorted = cell_time[order]
+    zero_pred = interp1d(t_sorted, np.zeros(len(t_sorted), dtype=np.float32), assume_sorted=True,
+                         copy=False, fill_value='extrapolate')
+
+    # one B-spline basis on the pseudotime, shared by every gene
+    try:
+        bs = BSplines(cell_time.reshape(-1, 1), df=n_knots, degree=3)
+    except ValueError:
+        bs = None
 
     for i_gene in range(count_matrix.shape[1]):
-        expr = count_matrix[:, i_gene]
-        
-        # Check for constant expression or insufficient data
-        if np.all(expr == expr[0]) or len(np.unique(cell_time)) < 2:
-            
-            # interp1d is not defined, fix it
-            # define interp1d
-            # interp1d = lambda x, y, **kwargs: np.interp(x, x[0], y[0], **kwargs)
-            pred_func = interp1d(cell_time, np.zeros_like(cell_time), fill_value='extrapolate')
-            models[i_gene] = {
-                'model': None,
-                'design': design_matrix[i_gene],
-                'pred_func': pred_func,
-                'expr': expr
-            }
+        expr = np.asarray(count_matrix[:, i_gene], dtype=float)
+
+        # constant expression, too few cells, or no basis: nothing to fit
+        if bs is None or np.all(expr == expr[0]) or len(np.unique(cell_time)) < 2:
+            models[i_gene] = {'model': None, 'design': design, 'pred_func': zero_pred}
             continue
-            
-        # Create B-spline basis
-        try:
-            bs = BSplines(cell_time.reshape(-1, 1), df=n_knots, degree=3)
-        except ValueError as e:
-            pred_func = interp1d(cell_time, np.zeros_like(cell_time), fill_value='extrapolate')
-            models[i_gene] = {
-                'model': None,
-                'design': design_matrix[i_gene],
-                'pred_func': pred_func,
-                'expr': expr
-            }
-            continue
-        
+
         # Fit GAM using GLMGam with explicit endog and smoother
         try:
             gam = GLMGam(endog=expr, smoother=bs, alpha=1e-6, family=NegativeBinomial(alpha=1.0))  # Add small regularization
-            
+
             # Suppress perfect separation warnings
             with catch_warnings():
                 simplefilter("ignore")
                 res = gam.fit()
-                
+
             if res is None:
-                pred_func = interp1d(cell_time, np.zeros_like(cell_time), fill_value='extrapolate')
-                models[i_gene] = {
-                    'model': None,
-                    'design': design_matrix[i_gene],
-                    'pred_func': pred_func,
-                    'expr': expr
-                }
+                models[i_gene] = {'model': None, 'design': design, 'pred_func': zero_pred}
             else:
+                fitted = np.asarray(res.predict(), dtype=np.float32)[order]
                 models[i_gene] = {
-                    'model': res,
-                    'design': design_matrix[i_gene],
-                    'pred_func': interp1d(cell_time, res.predict(), fill_value='extrapolate'),
-                    'expr': expr
+                    'model': SlimGAMResult(res, bs),      # coefficients, covariance, shared smoother
+                    'design': design,
+                    'pred_func': interp1d(t_sorted, fitted, assume_sorted=True, copy=False, fill_value='extrapolate'),
                 }
         except:
             # Fallback to linear regression if GAM fails
             lr = LinearRegression()
             X = cell_time.reshape(-1, 1)
             lr.fit(X, expr)
-            pred_func = interp1d(cell_time, lr.predict(X), fill_value='extrapolate')
+            fitted = np.asarray(lr.predict(X), dtype=np.float32)[order]
             models[i_gene] = {
                 'model': lr,
-                'design': design_matrix[i_gene],
-                'pred_func': pred_func,
-                'expr': expr
+                'design': design,
+                'pred_func': interp1d(t_sorted, fitted, assume_sorted=True, copy=False, fill_value='extrapolate'),
             }
     return {
         'models': models,
@@ -126,88 +133,64 @@ def fitGAM(count_matrix, cell_time, n_knots=7, cell_weights=None, gene_symbol=No
 
 def save_gamfit(gam_fit, save_dir):
     """
-    save gam fit to disk
+    Save a GAM fit to disk: metadata as .npy files, the slim models as one pickle and
+    the fitted expression values (float32) of every gene as one array.
     """
-    # check dir
-    if os.path.exists(save_dir) == False:
-        os.mkdir(save_dir)
+    import pickle
+    os.makedirs(save_dir, exist_ok=True)
 
-    gam_dir = os.path.join(save_dir,'GAM')
-    if os.path.exists(gam_dir) == False:
-        os.mkdir(gam_dir)
-
-    # save gene symbol, gene index , pseudotime
-    for k in ['gene_symbol','gene_names','pseudotime']:
+    for k in ['gene_symbol', 'gene_names', 'pseudotime']:
         np.save(os.path.join(save_dir, f"{k}.npy"), gam_fit[k])
 
-    # design is the same for every gene 
-    design = gam_fit['models'][0]['design']
-    np.save(os.path.join(save_dir, f"design.npy"), design)
+    models = gam_fit['models']
+    first = next(iter(models.values()))
+    np.save(os.path.join(save_dir, "design.npy"), first['design'])
 
-    Expr = np.zeros((len(gam_fit['models']), design.shape[0]))
+    # fitted values on the sorted pseudotime, shared x
+    t_sorted = np.sort(np.asarray(gam_fit['pseudotime'], dtype=float))
+    fitted = np.zeros((len(models), len(t_sorted)), dtype=np.float32)
+    for i, (gene_id, fit) in enumerate(models.items()):
+        if fit['pred_func'] is not None:
+            fitted[i] = fit['pred_func'](t_sorted)
+    np.save(os.path.join(save_dir, "fitted.npy"), fitted)
+    np.save(os.path.join(save_dir, "cell_time.npy"), t_sorted)
 
-    cell_time = None
+    with open(os.path.join(save_dir, "models.pkl"), "wb") as f:
+        pickle.dump({gene_id: fit['model'] for gene_id, fit in models.items()}, f)
 
-    # save model
-    i = 0
-    for gene_id, fit in gam_fit['models'].items():
-
-        if fit['model'] is not None:
-            fit['model'].save(os.path.join(gam_dir, f"{gene_id}_GAM.pkl"))
-
-            if cell_time is None:
-                cell_time = fit['pred_func'].x
-        
-        Expr[i] = fit['expr']
-        i += 1
-    np.save(os.path.join(save_dir, f"Expr.npy"), Expr)
-    np.save(os.path.join(save_dir, f"cell_time.npy"), cell_time)
 
 def load_gamfit(save_dir):
     """
-    Load GAM fit from saved directory
+    Load a GAM fit written by ``save_gamfit``.
 
-    Args:
-        save_dir (str): directory where GAM fit is saved
-    
     Returns:
-        gam_fit (dict): GAM fit, of key
+        gam_fit (dict): same layout as the output of ``fitGAM``
     """
-
-    gam_fit = {}
+    import pickle
     assert os.path.exists(save_dir)
 
-    for key in ['gene_symbol','gene_names','pseudotime']:
+    gam_fit = {}
+    for key in ['gene_symbol', 'gene_names', 'pseudotime']:
         gam_fit[key] = np.load(os.path.join(save_dir, f"{key}.npy"), allow_pickle=True)
 
-    # shared by all genes
-    Expr = np.load(os.path.join(save_dir, "Expr.npy"), allow_pickle=True)
     design = np.load(os.path.join(save_dir, "design.npy"), allow_pickle=True)
-    cell_time = np.load(os.path.join(save_dir, "cell_time.npy"), allow_pickle=True)
+    t_sorted = np.load(os.path.join(save_dir, "cell_time.npy"), allow_pickle=True)
+    fitted = np.load(os.path.join(save_dir, "fitted.npy"), allow_pickle=True)
+    with open(os.path.join(save_dir, "models.pkl"), "rb") as f:
+        slim_models = pickle.load(f)
 
-    # load gam fitted model for  each gene
     models = {}
-    gam_dir = os.path.join(save_dir,'GAM')
     for i, gene_id in enumerate(gam_fit['gene_names']):
-
-        models[gene_id] = {}
-        models[gene_id]['Expr'] = Expr[i, :]
-        models[gene_id]['design'] = design
-
-        pkl_path = os.path.join(gam_dir, f"{gene_id}_GAM.pkl")
-        if os.path.exists(pkl_path):
-            res = GLMGamResultsWrapper.load(pkl_path)
-            models[gene_id]['model'] = res
-            models[gene_id]['pred_func'] = interp1d(cell_time, res.predict(), fill_value='extrapolate')
-        else:
-            models[gene_id]['model'] = None
-            models[gene_id]['pred_func'] = None
-
+        models[gene_id] = {
+            'model': slim_models.get(gene_id),
+            'design': design,
+            'pred_func': interp1d(t_sorted, fitted[i], assume_sorted=True, copy=False, fill_value='extrapolate'),
+        }
     gam_fit['models'] = models
-
     return gam_fit
 
 # Add a simple wrapper function for easier use
+
 def fit_gam_simple(expr, time, n_knots=7):
     """
     Simple wrapper for GAM fitting
@@ -258,12 +241,10 @@ def process_gene_chunk(gene_indices, expression_matrix, cell_time, n_knots, gene
     
     Returns: dict with results for processed genes
     """
-    # Extract subset of expression matrix for these genes
-    sub_matrix = expression_matrix[:, gene_indices]
-    
-    # Run fitGAM on the subset
+    # `expression_matrix` holds only the columns of `gene_indices` (sliced by the caller),
+    # so a worker never receives the full matrix.
     result = fitGAM(
-        count_matrix=sub_matrix,
+        count_matrix=expression_matrix,
         cell_time=cell_time,
         n_knots=n_knots,
         gene_symbol=[gene_symbol[i] for i in gene_indices]
@@ -299,18 +280,14 @@ def run_fitGAM_parallel(expression_matrix, cell_time, genes, n_knots=7, n_cores=
     # Create equal-sized chunks of gene indices
     gene_indices = np.array_split(np.arange(n_genes), n_cores)
     
-    # Create partial function with fixed parameters
-    worker_func = partial(
-        process_gene_chunk,
-        expression_matrix=expression_matrix,
-        cell_time=cell_time,
-        n_knots=n_knots,
-        gene_symbol=genes
-    )
-    
+    # Fixed parameters; the expression columns of each chunk are passed separately so
+    # that every worker only receives (and holds) its own genes.
+    worker_func = partial(process_gene_chunk, cell_time=cell_time, n_knots=n_knots, gene_symbol=genes)
+    chunk_matrices = (np.ascontiguousarray(expression_matrix[:, idx]) for idx in gene_indices)
+
     # Run in parallel
     with ProcessPoolExecutor(max_workers=n_cores) as executor:
-        chunk_results = list(executor.map(worker_func, gene_indices))
+        chunk_results = list(executor.map(worker_func, gene_indices, chunk_matrices))
     
     # Combine results from all chunks
     combined_result = {

@@ -4,7 +4,8 @@ import numpy as np
 from ._base import fitGAM
 from ._association_test import AssociationTest
 
-from scipy.stats import pearsonr, multitest
+from scipy.stats import pearsonr
+from statsmodels.stats.multitest import multipletests
 from scipy.interpolate import interp1d
 
 from sklearn.preprocessing import MinMaxScaler
@@ -55,8 +56,8 @@ def select_top_de_genes(results_df, qval_threshold=0.05):
     Returns: list of gene indices passing threshold
     """
     # Filter significant genes
-    significant = results_df[~results_df['pvalue'].isna()]
-    significant['fdr'] = multitest.multipletests(significant['pvalue'], method='fdr_bh')[1]
+    significant = results_df[~results_df['pvalue'].isna()].copy()
+    significant['fdr'] = multipletests(significant['pvalue'], method='fdr_bh')[1]
     
     # Sort by Wald statistic
     significant = significant.query("`fdr` <= @qval_threshold").sort_values('waldStat', ascending=False)
@@ -96,13 +97,9 @@ def prepare_expression_data(gam_fit, pseudotime=None):
             gene_symbol.append(gam_fit['gene_symbol'][i])
         else:
             continue
-            
-        # Get predictions
-        
-        # Initialize DataFrame
-        expr_df = pd.DataFrame(np.stack(Expr_list).T, columns=gene_symbol)
-        expr_df.index = pseudotime
-        # Scale and add to DataFrame
-        # expr_df[f'gene_{gene_idx}'] = scaler.fit_transform(predictions.reshape(-1, 1)).flatten()
-    
+
+    # Build the DataFrame once (bins x genes)
+    expr_df = pd.DataFrame(np.stack(Expr_list).T, columns=gene_symbol)
+    expr_df.index = pseudotime
+
     return expr_df
