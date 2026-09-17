@@ -4,7 +4,7 @@
 ## Important resources
 
 ```{eval-rst}
-.. grid:: 3
+.. grid:: 2 2 4 4
     :gutter: 1
 
     .. grid-item-card:: About
@@ -12,6 +12,12 @@
         :link-type: doc
 
         Learn more about :mod:`pseudodynamics+`.
+
+    .. grid-item-card:: Training options
+        :link: training_options
+        :link-type: doc
+
+        Opt-in training flags and their defaults.
 
     .. grid-item-card:: API
         :link: api/index
@@ -34,6 +40,7 @@
 :titlesonly: true
 
 about/index
+training_options
 api/index
 tutorials
 references
