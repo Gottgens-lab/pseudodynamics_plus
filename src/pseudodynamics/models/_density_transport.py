@@ -81,6 +81,14 @@ class Density_Transfer(nn.Module):
         return ds
 
     def cellstate_drift(self, s0, integrate_time):
+        """
+        Integrate the drift field v from the initial cell states s0.
+
+        integrate_time : 1-D array in *scaled* time, i.e. the dataset's normalized time
+            (``DataSet.T_b``) divided by ``model.time_scale_factor`` -- the same unit that
+            ``transition_by_batch`` and the training ODE use. The velocity function
+            multiplies by ``time_scale_factor`` to obtain the network's time input.
+        """
         
         # get device
         if isinstance(s0, np.ndarray):
@@ -93,7 +101,7 @@ class Density_Transfer(nn.Module):
         with torch.no_grad():
             try:
                 s_out = odeint(self.velocity, y0=s0, 
-                        t=torch.tensor(integrate_time).to(device)*self.model.time_scale_factor,
+                        t=torch.tensor(integrate_time).to(device),   # scaled time (T_b / time_scale_factor), as in training and transition_by_batch
                         atol=self.model.ode_tol,
                         rtol=self.model.ode_tol,
 
@@ -101,7 +109,7 @@ class Density_Transfer(nn.Module):
             except AssertionError:  #underflow
                 step_size = np.around((integrate_time[-1] - integrate_time[0]) / 100 , 2)
                 s_out = odeint(self.velocity, y0=s0, 
-                        t=torch.tensor(integrate_time).to(device)*self.model.time_scale_factor,
+                        t=torch.tensor(integrate_time).to(device),   # scaled time (T_b / time_scale_factor), as in training and transition_by_batch
                         atol=self.model.ode_tol,
                         rtol=self.model.ode_tol,
                         method='rk4',

@@ -1,0 +1,125 @@
+{
+    "run_date": "2026-09-19 15:37:56",
+    "experiment_config": {
+        "dataset": "data_toy/tom_pos_toy",
+        "gpu_devices": "None",
+        "progress_bar": "False",
+        "save_dir": "/Users/weizhongzheng/Documents/python_project/pseudodynamics_plus/logs/tom_pos_toy/pde_params_tsense",
+        "version": 0,
+        "checkpoint_dir": "/Users/weizhongzheng/Documents/python_project/pseudodynamics_plus/logs/tom_pos_toy/pde_params_tsense/lightning_logs/version_0"
+    },
+    "dataset_config": {
+        "cellstate_key": "DM_scaled",
+        "n_dimension": 10,
+        "kde_kws": {
+            "bw_method": 0.5
+        },
+        "timepoint_idx": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            6,
+            8
+        ],
+        "deltax_key": "Delta_DM",
+        "norm_time": false,
+        "knn_volume": false
+    },
+    "model_config": {
+        "model_class": "pde_params",
+        "channels": null,
+        "activation_fn": null,
+        "ode_tol": 0.0001,
+        "growth_weight": 0,
+        "R_weight": 1,
+        "D_penalty": 0.1,
+        "deltax_weight": 0.01,
+        "weight_intensity": 1,
+        "time_scale_factor": 5,
+        "time_sensitive": true,
+        "cfm_weight": 0,
+        "D_var_weight": 0,
+        "neuralode_weight": 2,
+        "v_channels": [
+            11,
+            64,
+            64,
+            10
+        ],
+        "g_channels": [
+            11,
+            64,
+            64,
+            1
+        ],
+        "D_channels": [
+            11,
+            64,
+            64,
+            1
+        ]
+    },
+    "training_config": {
+        "batch_size": 50,
+        "schedule_lr": "CyclicLR",
+        "lr": 0.0003,
+        "max_epochs": 300,
+        "optimizer": "Adam"
+    },
+    "raw_args": {
+        "config": null,
+        "dataset": "data_toy/tom_pos_toy",
+        "cellstate_key": "DM_scaled",
+        "model": "pde_params",
+        "pretrained": null,
+        "gpu_devices": "None",
+        "log_name": "tom_pos_toy",
+        "lr": 0.0003,
+        "schedule_lr": "CyclicLR",
+        "n_grid": 300,
+        "n_dimension": 10,
+        "timepoint_idx": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            6,
+            8
+        ],
+        "knn_volume": false,
+        "batch_size": 50,
+        "bw": 0.5,
+        "tol": 0.0001,
+        "channels": "64,64",
+        "D_penalty": null,
+        "deltax_key": "Delta_DM",
+        "deltax_weight": 0.01,
+        "weight_intensity": null,
+        "R_weight": null,
+        "growth_weight": null,
+        "time_scale_factor": 5,
+        "norm_time": false,
+        "time_sensitive": true,
+        "cfm_weight": null,
+        "D_var_weight": null,
+        "neuralode_weight": null,
+        "D_clip": null,
+        "cfm_unbalanced_reg_m": null,
+        "g_init_rate": null,
+        "growth_loss_mode": "legacy",
+        "growth_pop_ref": "cellsum",
+        "num_workers": 0,
+        "residual_mode": "raw",
+        "density_estimator": "kde",
+        "gmm_k_max": 5,
+        "seed": 0,
+        "max_epochs": 200,
+        "progress_bar": "False",
+        "resume_ckpt": null,
+        "zero_growth": false,
+        "equal_mass": false
+    }
+}

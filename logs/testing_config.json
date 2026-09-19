@@ -1,8 +1,8 @@
 {
     "raw_args": {
         "config": null,
-        "dataset": "tom_pos",
-        "log_name": "tom_pos_fulltime",
+        "dataset": "data_toy/tom_pos_toy",
+        "log_name": "tom_pos_toy",
         "progress_bar": true,
         "model": "pde_params",
         "time_sensitive": true,
@@ -13,7 +13,7 @@
         "tol": 0.0001,
         "time_scale_factor": 1,
         "pretrained": null,
-        "gpu_devices": 0,
+        "gpu_devices": null,
         "weight_intensity": null,
         "deltax_weight": 0.01,
         "R_weight": 1,
@@ -32,7 +32,7 @@
         ],
         "knn_volume": false,
         "batch_size": 50,
-        "bw": null,
+        "bw": 0.5,
         "norm_time": false
     }
 }

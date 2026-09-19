@@ -64,7 +64,7 @@ class ExperimentConfig:
         return {
             'cellstate_key': args.cellstate_key,
             'n_dimension': args.n_dimension,
-            "kde_kws": {"bw_method":None},
+            "kde_kws": {"bw_method": getattr(args, "bw", None)},   # record the KDE bandwidth used for training
             'timepoint_idx': args.timepoint_idx,
             'deltax_key': args.deltax_key,
             'norm_time': args.norm_time,

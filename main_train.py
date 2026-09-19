@@ -118,10 +118,13 @@ if getattr(args, 'seed', None) is not None:
 
 path = os.path.abspath(".")
 h5_path = os.path.join(path, f'{args.dataset}.h5ad')
-# find adata path
+# find adata path: `--dataset` may be a name under data/ (data/<name>.h5ad) or a path
+# relative to the working directory (e.g. data_toy/tom_pos_toy); logs go under ./logs
 if not os.path.exists(h5_path):
     main_path = path
     h5_path = os.path.join(path, f'data/{args.dataset}.h5ad')
+elif os.path.dirname(args.dataset):
+    main_path = path
 else:
     main_path = os.path.dirname(path)
 
@@ -258,8 +261,10 @@ val_DL = DataLoader(val_DS, batch_size=None, num_workers=_nw)
 ##############################
 
 device = 'gpu' if torch.cuda.is_available() else 'cpu'
-device = 'cpu' if args.gpu_devices == None else 'gpu'
-gpu_device = args.gpu_devices if args.gpu_devices == None else [int(args.gpu_devices)]
+# `-G None` (or omitting -G) trains on CPU; `-G 0` selects GPU 0
+_no_gpu = args.gpu_devices in (None, 'None', 'none')
+device = 'cpu' if _no_gpu else 'gpu'
+gpu_device = 'auto' if _no_gpu else [int(args.gpu_devices)]
 
 trainer = pl.Trainer(
                     #auto_lr_find=True,

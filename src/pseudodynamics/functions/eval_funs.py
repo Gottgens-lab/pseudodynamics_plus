@@ -115,7 +115,9 @@ def agg_param(adata, param:np.ndarray, groupby_key='cell_type', timepoints=None,
         ad_t = adata[adata.obs[timepoint_key] == t]
         ct_df.append( ad_t.obs.groupby(groupby_key).agg({timepoint_key:'count'}) )
 
-    ct_df = pd.concat(ct_df, axis=1)
+    # subsetting an AnnData drops unused categories, so align the count table with the
+    # aggregated table (a category with no cell at all counts as below threshold)
+    ct_df = pd.concat(ct_df, axis=1).reindex(agg_param_df.index)
     ct_count_thres_binary = ct_df.where(ct_df>=cellcount_threshold, np.nan) / ct_df.values
 
     assert ct_count_thres_binary.shape == agg_param_df.shape
@@ -409,30 +411,34 @@ def project_params_to_pseudotime(adata, params, param_names='g v2', timepoints=N
 def assign_nearest_cell(input_ay, adata, cellstate_key, n_dimension=None, n_trees=10,  n_neighbors=None, annotation=None, return_model=False, idx=None):
     """
     """
-    import annoy
-
-    
     cellstate = adata.obsm[cellstate_key][:,:n_dimension]
     assert input_ay.shape[1] == cellstate.shape[1], "the dimension of cellstate and the query don't match"
-
-    # build index if not given
-    if idx is None:
-        idx = annoy.AnnoyIndex(cellstate.shape[1], "euclidean")
-
-        [idx.add_item(i, cellstate[i]) for i in range(len(adata))]
-        idx.build(n_trees)
-
     # define number of neighbors
     if n_neighbors is None:
         try:
             n_neighbors = adata.uns['neighbors']['params']['n_neighbors']
         except:
             n_neighbors = n_trees
-
+    # build index if not given: annoy (approximate, fast) when installed, exact scikit-learn otherwise
+    try:
+        import annoy
+    except ImportError:
+        annoy = None
+    if idx is None:
+        if annoy is not None:
+            idx = annoy.AnnoyIndex(cellstate.shape[1], "euclidean")
+            [idx.add_item(i, cellstate[i]) for i in range(len(adata))]
+            idx.build(n_trees)
+        else:
+            from sklearn.neighbors import NearestNeighbors
+            idx = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean").fit(cellstate)
     # find neighbors
-    nn = np.array(
-        [idx.get_nns_by_vector(input_ay[i], n_neighbors) for i in range(len(input_ay))]
-    )
+    if annoy is not None and isinstance(idx, annoy.AnnoyIndex):
+        nn = np.array(
+            [idx.get_nns_by_vector(input_ay[i], n_neighbors) for i in range(len(input_ay))]
+        )
+    else:
+        nn = idx.kneighbors(np.asarray(input_ay), n_neighbors=n_neighbors, return_distance=False)
     nn_return = nn
 
     # if annotation_key is given, return the annotation of the nearest cells

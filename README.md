@@ -30,13 +30,27 @@ Store the population size information in `AnnData.uns['pop']` and save as `h5ad`
 
 ```bash
 # with GPU
-python main_train.py --config_path config.json -G 0
+python main_train.py --config config.json -G 0
 
 # without GPU
-python main_train.py --config_path config.json -G None
+python main_train.py --config config.json -G None
 ```
 
 All opt-in training flags and their defaults are documented on the [Training options](https://pseudodynamics-plus.readthedocs.io/en/latest/training_options.html) page.
+
+### Toy dataset
+`data_toy/tom_pos_toy.h5ad` is a 5,000-cell subsample of the Tom+ haematopoiesis dataset (6,157 genes: the
+highly variable genes plus all mouse transcription factors) with every field that the tutorials need. It
+trains on a laptop CPU in about 14 minutes, and tutorials 2-5 run on it end to end using the checkpoint
+shipped under `logs/tom_pos_toy/`:
+
+```bash
+python main_train.py -D data_toy/tom_pos_toy -K DM_scaled --n_dimension 10 --channels 64,64 \
+    --batch_size 50 --bw 0.5 --timepoint_idx "[0,1,2,3,4,6,8]" --time_sensitive \
+    --max_epochs 200 --seed 0 -G None -L tom_pos_toy
+```
+
+`data_toy/make_toy_dataset.py` rebuilds the toy file from the full `data/tom_pos.h5ad`.
 
 
 ## Branches
@@ -86,5 +100,5 @@ logs/<experiment_name>/
 To reproduce a run, point `main_train.py` at the stored config:
 
 ```bash
-python main_train.py --config_path logs/<experiment_name>/V0_config.json -G 0
+python main_train.py --config logs/<experiment_name>/V0_config.json -G 0
 ```
